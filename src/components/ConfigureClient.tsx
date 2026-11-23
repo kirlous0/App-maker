@@ -132,6 +132,7 @@ export function ConfigureClient({
         }
         setAnalysis(data.analysis);
         setWorkflowStatus(data.workflowStatus || null);
+        setWorkflowApproved(false);
         if (data.latestCommit) {
           setBranchState((prev) => ({ ...prev, latestCommit: data.latestCommit! }));
         }
@@ -844,18 +845,38 @@ export function ConfigureClient({
             )}
           </section>
 
-          {/* Workflow Approval / Installation */}
-          {workflowStatus && !workflowStatus.installed ? (
-            <section className="rounded-lg border border-sky-500/40 bg-[#0E1117] p-5 space-y-4">
+          {/* Workflow Approval / Installation / Update */}
+          {workflowStatus && (!workflowStatus.installed || !workflowStatus.upToDate) ? (
+            <section
+              className={`rounded-lg border p-5 space-y-4 ${
+                workflowStatus.installed
+                  ? 'border-amber-500/45 bg-amber-500/5'
+                  : 'border-sky-500/40 bg-[#0E1117]'
+              }`}
+            >
               <div className="space-y-1">
                 <h2 className="text-base font-semibold text-white flex items-center gap-2">
-                  <Code2 className="h-4 w-4 text-sky-400" />
-                  <span>{dict.configure.workflowRequiredTitle}</span>
+                  <Code2
+                    className={`h-4 w-4 ${
+                      workflowStatus.installed ? 'text-amber-400' : 'text-sky-400'
+                    }`}
+                  />
+                  <span>
+                    {workflowStatus.installed
+                      ? dict.configure.workflowUpdateTitle
+                      : dict.configure.workflowRequiredTitle}
+                  </span>
                 </h2>
                 <p className="text-xs sm:text-sm text-[#9AA3B2]">
-                  {dict.configure.workflowRequiredDesc}
+                  {workflowStatus.installed
+                    ? dict.configure.workflowUpdateDesc
+                    : dict.configure.workflowRequiredDesc}
                 </p>
-                <p className="font-mono text-[11px] text-sky-300">
+                <p
+                  className={`font-mono text-[11px] ${
+                    workflowStatus.installed ? 'text-amber-300' : 'text-sky-300'
+                  }`}
+                >
                   {dict.configure.workflowPermissionsNote}
                 </p>
               </div>
@@ -886,12 +907,18 @@ export function ConfigureClient({
                 type="button"
                 disabled={!workflowApproved || installingWorkflow}
                 onClick={handleInstallWorkflow}
-                className="inline-flex items-center gap-2 rounded-md bg-sky-500 px-4 py-2 text-xs sm:text-sm font-semibold text-[#04121A] hover:bg-sky-400 disabled:opacity-50"
+                className={`inline-flex items-center gap-2 rounded-md px-4 py-2 text-xs sm:text-sm font-semibold disabled:opacity-50 ${
+                  workflowStatus.installed
+                    ? 'bg-amber-400 text-[#1A1204] hover:bg-amber-300'
+                    : 'bg-sky-500 text-[#04121A] hover:bg-sky-400'
+                }`}
               >
                 {installingWorkflow && <Loader2 className="h-4 w-4 animate-spin" />}
                 <span>
                   {installingWorkflow
                     ? dict.configure.workflowInstalling
+                    : workflowStatus.installed
+                    ? dict.configure.workflowUpdateButton
                     : dict.configure.workflowInstallButton}
                 </span>
               </button>

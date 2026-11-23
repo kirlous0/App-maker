@@ -1,16 +1,18 @@
 import { NextResponse } from 'next/server';
 import { createInitialStagesState } from '@/lib/builds/stages';
-import { WORKFLOW_FILE_NAME } from '@/lib/builds/workflow-template';
+import { getRepo2ApkWorkflowYaml, WORKFLOW_FILE_NAME, WORKFLOW_FILE_PATH } from '@/lib/builds/workflow-template';
 import { decryptSecret, generateNonce } from '@/lib/crypto';
 import { dbStore } from '@/lib/db';
 import {
   dispatchWorkflow,
   fetchBranchLatestCommit,
+  fetchRepoFileContent,
   setRepoActionSecret,
 } from '@/lib/github/client';
 import { getAuthorizedRepoToken } from '@/lib/github/oauth';
 import { enforceBuildConcurrencyLimit, enforceRateLimit } from '@/lib/security/rate-limit';
 import { getSession } from '@/lib/session';
+import type { AndroidProjectAnalysis } from '@/lib/types';
 
 export async function POST(
   request: Request,
@@ -49,11 +51,35 @@ export async function POST(
     const token = await getAuthorizedRepoToken(session.userId, previous.installation_id);
     const [owner, repo] = previous.repo_full_name.split('/');
 
+    const workflowFile = await fetchRepoFileContent(
+      token,
+      owner,
+      repo,
+      WORKFLOW_FILE_PATH,
+      previous.branch
+    );
+    if (!workflowFile || workflowFile.content.trim() !== getRepo2ApkWorkflowYaml().trim()) {
+      return NextResponse.json(
+        {
+          error: 'WORKFLOW_UPDATE_REQUIRED',
+          repoFullName: previous.repo_full_name,
+          installationId: previous.installation_id,
+          branch: previous.branch,
+        },
+        { status: 409 }
+      );
+    }
+
     let commitSha = previous.commit_sha;
     if (useLatestCommit) {
       const latest = await fetchBranchLatestCommit(token, owner, repo, previous.branch);
       commitSha = latest.sha;
     }
+
+    const projectRow = previous.project_id
+      ? await dbStore.getProjectById(session.userId, previous.project_id).catch(() => null)
+      : null;
+    const analysis = (projectRow?.analysis_json as AndroidProjectAnalysis | null) || null;
 
     let useRepo2ApkSecrets = false;
     if (previous.build_type === 'release' && previous.signing_config_id) {
@@ -132,8 +158,9 @@ export async function POST(
       abi_mode: previous.abi_mode,
       build_name: previous.build_name || '',
       build_number: previous.build_number || '',
-      java_version: '17',
-      flutter_version: 'stable',
+      java_version: analysis?.recommendedJdk || '17',
+      flutter_version: analysis?.flutterVersion || 'stable',
+      compile_sdk: analysis?.androidSdk?.compileSdk || '',
       use_repo2apk_secrets: useRepo2ApkSecrets ? 'true' : 'false',
     });
 

@@ -270,12 +270,17 @@ function detectJavaVersion(contents: string[], agpVersion: string | null): {
     null;
 
   let recommendedJdk = '17';
+  const agpMajor = agpVersion ? parseFloat(agpVersion) : NaN;
   if (explicit) {
     const major = explicit === '1.8' ? 8 : parseInt(explicit, 10);
-    if (major >= 21) recommendedJdk = '21';
+    if (major >= 21 || (!Number.isNaN(agpMajor) && agpMajor >= 9.0)) recommendedJdk = '21';
     else if (major >= 17) recommendedJdk = '17';
-    else if (major >= 11) recommendedJdk = '17'; // AGP 8+ runs on 17 cleanly with sourceCompat 11
+    else if (!Number.isNaN(agpMajor) && agpMajor < 7.0) recommendedJdk = '11';
     else recommendedJdk = '17';
+  } else if (!Number.isNaN(agpMajor) && agpMajor >= 9.0) {
+    recommendedJdk = '21';
+  } else if (!Number.isNaN(agpMajor) && agpMajor < 7.0) {
+    recommendedJdk = '11';
   } else if (agpVersion && parseFloat(agpVersion) >= 8.3) {
     recommendedJdk = '17';
   }

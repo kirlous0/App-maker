@@ -60,6 +60,7 @@ export function BuildMonitorClient({
   const [copied, setCopied] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState<{ message: string; needsWorkflowUpdate: boolean } | null>(null);
   const [nowTick, setNowTick] = useState(() => Date.now());
 
   const isActive = ['queued', 'running', 'validating', 'storing'].includes(job.status);
@@ -188,15 +189,26 @@ export function BuildMonitorClient({
 
   const handleRetry = async (useLatestCommit: boolean) => {
     setRetrying(true);
+    setRetryError(null);
     try {
       const res = await fetch(`/api/builds/${job.id}/retry`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ useLatestCommit }),
       });
-      const data = (await res.json()) as { build?: { id: string } };
+      const data = (await res.json()) as { build?: { id: string }; error?: string };
       if (res.ok && data.build) {
         router.push(`/builds/${data.build.id}`);
+      } else if (data.error === 'WORKFLOW_UPDATE_REQUIRED') {
+        setRetryError({
+          message: dict.monitor.workflowUpdateRequiredError,
+          needsWorkflowUpdate: true,
+        });
+      } else {
+        setRetryError({
+          message: data.error || 'Retry failed.',
+          needsWorkflowUpdate: false,
+        });
       }
     } finally {
       setRetrying(false);
@@ -352,7 +364,26 @@ export function BuildMonitorClient({
               <RefreshCw className="h-3.5 w-3.5" />
               <span>{dict.monitor.retryLatestCommit}</span>
             </button>
+            <Link
+              href={`/configure?repo=${encodeURIComponent(job.repo_full_name)}&installationId=${job.installation_id}`}
+              className="inline-flex items-center gap-1.5 rounded-md border border-sky-500/40 bg-sky-500/10 px-3.5 py-2 text-xs font-medium text-sky-200 hover:bg-sky-500/20"
+            >
+              <span>{dict.monitor.openConfigureToUpdate}</span>
+            </Link>
           </div>
+          {retryError && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-2">
+              <span>{retryError.message}</span>
+              {retryError.needsWorkflowUpdate && (
+                <Link
+                  href={`/configure?repo=${encodeURIComponent(job.repo_full_name)}&installationId=${job.installation_id}`}
+                  className="rounded bg-amber-400 px-3 py-1 font-semibold text-[#1A1204] hover:bg-amber-300"
+                >
+                  {dict.monitor.openConfigureToUpdate}
+                </Link>
+              )}
+            </div>
+          )}
         </section>
       )}
 

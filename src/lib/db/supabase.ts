@@ -246,6 +246,21 @@ export const supabaseStore = {
       .eq('project_dir', projectDir);
   },
 
+  async getProjectById(
+    userId: string,
+    projectId: string
+  ): Promise<{ id: string; analysis_json: unknown } | null> {
+    const db = getSupabaseAdmin();
+    const { data, error } = await db
+      .from('projects')
+      .select('id, analysis_json')
+      .eq('user_id', userId)
+      .eq('id', projectId)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    return (data as { id: string; analysis_json: unknown }) || null;
+  },
+
   async listSigningConfigs(userId: string): Promise<SigningConfigSummary[]> {
     const db = getSupabaseAdmin();
     const { data, error } = await db

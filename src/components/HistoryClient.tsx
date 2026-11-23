@@ -37,6 +37,10 @@ export function HistoryClient({ lang, dict, initialBuilds }: HistoryClientProps)
   const [statusFilter, setStatusFilter] = useState('all');
   const [searchRepo, setSearchRepo] = useState('');
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [actionAlert, setActionAlert] = useState<{
+    message: string;
+    configureHref?: string;
+  } | null>(null);
 
   const filtered = useMemo(() => {
     const q = searchRepo.trim().toLowerCase();
@@ -51,15 +55,28 @@ export function HistoryClient({ lang, dict, initialBuilds }: HistoryClientProps)
 
   const handleRebuild = async (buildId: string, useLatestCommit: boolean) => {
     setBusyId(buildId);
+    setActionAlert(null);
     try {
       const res = await fetch(`/api/builds/${buildId}/retry`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ useLatestCommit }),
       });
-      const data = (await res.json()) as { build?: { id: string } };
+      const data = (await res.json()) as {
+        build?: { id: string };
+        error?: string;
+        repoFullName?: string;
+        installationId?: number;
+      };
       if (res.ok && data.build) {
         router.push(`/builds/${data.build.id}`);
+      } else if (data.error === 'WORKFLOW_UPDATE_REQUIRED' && data.repoFullName && data.installationId) {
+        setActionAlert({
+          message: dict.monitor.workflowUpdateRequiredError,
+          configureHref: `/configure?repo=${encodeURIComponent(data.repoFullName)}&installationId=${data.installationId}`,
+        });
+      } else if (!res.ok) {
+        setActionAlert({ message: data.error || 'Rebuild failed.' });
       }
     } finally {
       setBusyId(null);
@@ -113,6 +130,20 @@ export function HistoryClient({ lang, dict, initialBuilds }: HistoryClientProps)
           <option value="timed_out">{dict.monitor.statusLabels.timed_out}</option>
         </select>
       </div>
+
+      {actionAlert && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3">
+          <span>{actionAlert.message}</span>
+          {actionAlert.configureHref && (
+            <Link
+              href={actionAlert.configureHref}
+              className="rounded-md bg-amber-400 px-3 py-1.5 font-semibold text-[#1A1204] hover:bg-amber-300"
+            >
+              {dict.monitor.openConfigureToUpdate}
+            </Link>
+          )}
+        </div>
+      )}
 
       {filtered.length === 0 ? (
         <div className="rounded-lg border border-[#1F2430] bg-[#0E1117] p-12 text-center space-y-3">

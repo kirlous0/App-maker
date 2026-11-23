@@ -5,7 +5,9 @@ import { extractApkFromGitHubArtifactZip, validateApkBuffer } from '@/lib/androi
 import { computeBuildCommand } from '@/lib/android/command-builder';
 import { analyzeAndroidProject, discoverCandidateProjectDirectories } from '@/lib/android/detector';
 import { classifyBuildFailure } from '@/lib/android/error-classifier';
+import { getRepo2ApkWorkflowYaml } from '@/lib/builds/workflow-template';
 import { buildGitHubAppManifest, formatVercelGitHubAppEnv } from '@/lib/github/manifest';
+import YAML from 'yaml';
 import {
   decryptSecret,
   encryptSecret,
@@ -309,6 +311,92 @@ android {
     });
     expect(javaServer.isBuildable).toBe(false);
     expect(javaServer.nonAndroidReason?.code).toBe('JAVA_NON_ANDROID_PROJECT');
+  });
+
+  it('analyzes AGP 9.1 / Gradle 9.3.1 projects without gradlew cleanly (UltraCam profile)', async () => {
+    const files: Record<string, string> = {
+      'settings.gradle.kts': 'include(":app")',
+      'build.gradle.kts': 'plugins { alias(libs.plugins.android.application) apply false }',
+      'gradle/libs.versions.toml':
+        '[versions]\nagp = "9.1.1"\nkotlin = "2.4.21"\n[plugins]\nandroid-application = { id = "com.android.application", version.ref = "agp" }',
+      'gradle/wrapper/gradle-wrapper.properties':
+        'distributionUrl=https\\://services.gradle.org/distributions/gradle-9.3.1-bin.zip',
+      'app/build.gradle.kts': `
+        android {
+          namespace = "com.example"
+          compileSdk { version = release(36) { minorApiLevel = 1 } }
+          defaultConfig {
+            applicationId = "com.aistudio.ultracam.k7m9qx"
+            minSdk = 24
+            targetSdk = 36
+          }
+          compileOptions {
+            sourceCompatibility = JavaVersion.VERSION_11
+            targetCompatibility = JavaVersion.VERSION_11
+          }
+        }
+      `,
+    };
+    const analysis = await analyzeAndroidProject({
+      repoFullName: 'kirlous0/Ultra',
+      branch: 'main',
+      commitSha: 'd32c9b16',
+      projectDir: '.',
+      treePaths: [...Object.keys(files), 'app/src/main/java/com/example/MainActivity.kt'],
+      fetchFile: async (p) => files[p] ?? null,
+    });
+
+    expect(analysis.isBuildable).toBe(true);
+    expect(analysis.agpVersion).toBe('9.1.1');
+    expect(analysis.gradleWrapperVersion).toBe('9.3.1');
+    expect(analysis.hasGradleWrapper).toBe(false);
+    expect(analysis.recommendedJdk).toBe('21');
+    expect(analysis.androidSdk.compileSdk).toBe('36');
+  });
+});
+
+describe('Hardened Workflow Template & Failure Classifier', () => {
+  it('generates valid workflow YAML without legacy setup-android@v3 or obsolete tools package', () => {
+    const yml = getRepo2ApkWorkflowYaml();
+    const parsed = YAML.parse(yml) as {
+      on?: { workflow_dispatch?: { inputs?: Record<string, unknown> } };
+      jobs?: { build_apk?: { steps?: Array<{ name?: string; uses?: string; run?: string }> } };
+    };
+    expect(parsed.on?.workflow_dispatch?.inputs?.compile_sdk).toBeDefined();
+    const steps = parsed.jobs?.build_apk?.steps || [];
+    expect(steps.some((s) => s.uses?.includes('android-actions/setup-android@v3'))).toBe(false);
+    const sdkStep = steps.find((s) => s.name === '[Stage 3] Setup Android SDK');
+    expect(sdkStep?.run).toContain('sdkmanager');
+    expect(sdkStep?.run).toContain('platform-tools');
+    expect(sdkStep?.run).not.toContain('"tools"');
+    const cfgStep = steps.find((s) => s.name === '[Stage 5] Android project configuration');
+    expect(cfgStep?.run).toContain('distributionUrl');
+    expect(cfgStep?.run).toContain('debug.keystore');
+    expect(cfgStep?.run).toContain('KEYSTORE_PATH');
+  });
+
+  it('extracts real sdkmanager failure instead of GitHub Actions metadata headers', () => {
+    const log = [
+      '2026-11-23T18:57:39Z with:',
+      '2026-11-23T18:57:39Z   accept-android-sdk-licenses: true',
+      '2026-11-23T18:57:39Z   packages: tools platform-tools',
+      '2026-11-23T18:57:44Z Error: The process \'/usr/local/lib/android/sdk/cmdline-tools/16.0/bin/sdkmanager\' failed with exit code 1',
+    ].join('\n');
+
+    const diag = classifyBuildFailure({ logText: log });
+    expect(diag.code).toBe('ANDROID_SDK_CONFIG_ERROR');
+    expect(diag.matchedLogExcerpt).toContain('sdkmanager');
+    expect(diag.matchedLogExcerpt).not.toContain('accept-android-sdk-licenses: true');
+
+    expect(
+      classifyBuildFailure({ logText: 'File google-services.json is missing.' }).code
+    ).toBe('GOOGLE_SERVICES_MISSING');
+    expect(
+      classifyBuildFailure({ logText: 'java.lang.OutOfMemoryError: Java heap space' }).code
+    ).toBe('GRADLE_OUT_OF_MEMORY');
+    expect(
+      classifyBuildFailure({ logText: 'Manifest merger failed : uses-sdk:minSdkVersion 21' }).code
+    ).toBe('MANIFEST_MERGER_ERROR');
   });
 });
 

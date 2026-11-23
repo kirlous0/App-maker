@@ -1,12 +1,27 @@
 import type { ErrorDiagnostic } from '@/lib/types';
 
+const METADATA_HEADER_LINE =
+  /^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+(?:with:|env:|shell:|accept-android-sdk-licenses:|log-accepted-android-sdk-licenses:|cmdline-tools-version:|packages:)/i;
+
 function extractExcerpt(logText: string, regex: RegExp): string | undefined {
   const lines = logText.split('\n');
-  const idx = lines.findIndex((line) => regex.test(line));
+  let idx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (METADATA_HEADER_LINE.test(line)) continue;
+    if (regex.test(line)) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx === -1) {
+    idx = lines.findIndex((line) => regex.test(line));
+  }
   if (idx === -1) return undefined;
   const start = Math.max(0, idx - 2);
   const end = Math.min(lines.length, idx + 6);
-  return lines.slice(start, end).join('\n').slice(0, 1200);
+  const excerptLines = lines.slice(start, end).filter((l) => !METADATA_HEADER_LINE.test(l));
+  return (excerptLines.length > 0 ? excerptLines : lines.slice(start, end)).join('\n').slice(0, 1200);
 }
 
 export function classifyBuildFailure(params: {
@@ -38,7 +53,7 @@ export function classifyBuildFailure(params: {
       explanationEn: 'The workflow finished without producing a valid APK file in the output directory.',
       remediationAr: 'تأكد من أن الوحدة المحددة تطبق com.android.application وأن أمر البناء ينتج APK وليس AAB.',
       remediationEn: 'Ensure the selected module applies com.android.application and produces an .apk artifact.',
-      matchedLogExcerpt: extractExcerpt(text, /apk|assemble/i),
+      matchedLogExcerpt: extractExcerpt(text, /No valid APK|apk|assemble/i),
     };
   }
 
@@ -54,16 +69,42 @@ export function classifyBuildFailure(params: {
     };
   }
 
-  if (/gradlew: Permission denied|gradlew: not found|No such file or directory.*gradlew/i.test(text)) {
+  if (/Unexpected inputs provided/i.test(text)) {
+    return {
+      code: 'WORKFLOW_UPDATE_REQUIRED',
+      titleAr: 'ملف Workflow في المستودع قديم ويحتاج تحديثاً',
+      titleEn: 'Repository Workflow File Outdated',
+      explanationAr: 'ملف .github/workflows/repo2apk-build.yml داخل المستودع لا يتطابق مع أحدث قالب بناء.',
+      explanationEn: 'The .github/workflows/repo2apk-build.yml file in the repository is outdated.',
+      remediationAr: 'افتح صفحة التهيئة واعتمد تحديث ملف Workflow ثم أعد تشغيل البناء.',
+      remediationEn: 'Open Configure, approve the updated workflow file, and trigger the build again.',
+      matchedLogExcerpt: extractExcerpt(text, /Unexpected inputs/i),
+    };
+  }
+
+  if (/gradlew: Permission denied|gradlew: not found|No such file or directory.*gradlew|Neither \.\/gradlew nor system gradle/i.test(text)) {
     return {
       code: 'MISSING_GRADLE_WRAPPER',
       titleAr: 'ملف Gradle Wrapper مفقود أو غير قابل للتنفيذ',
       titleEn: 'Missing Gradle Wrapper',
-      explanationAr: 'فشل العثور على ./gradlew أو gradle-wrapper.jar داخل المستودع.',
-      explanationEn: 'The build runner could not locate ./gradlew or gradle/wrapper/gradle-wrapper.jar.',
-      remediationAr: 'أضف ./gradlew ومجلد gradle/wrapper/ إلى المستودع عبر `gradle wrapper`.',
-      remediationEn: 'Commit ./gradlew and gradle/wrapper/* into your repository.',
-      matchedLogExcerpt: extractExcerpt(text, /gradlew/i),
+      explanationAr: 'فشل العثور على ./gradlew أو تحميل إصدار Gradle المحدد في gradle-wrapper.properties.',
+      explanationEn: 'The build runner could not locate ./gradlew or download the Gradle distribution.',
+      remediationAr: 'حدّث ملف Workflow من صفحة التهيئة أو أضف ./gradlew ومجلد gradle/wrapper/ إلى المستودع.',
+      remediationEn: 'Update the workflow file or commit ./gradlew and gradle/wrapper/* into your repository.',
+      matchedLogExcerpt: extractExcerpt(text, /gradlew|gradle/i),
+    };
+  }
+
+  if (/OutOfMemoryError|Java heap space|GC overhead limit exceeded|Metaspace/i.test(text)) {
+    return {
+      code: 'GRADLE_OUT_OF_MEMORY',
+      titleAr: 'نفاد ذاكرة JVM أثناء ترجمة Gradle',
+      titleEn: 'Gradle Out of Memory',
+      explanationAr: 'تجاوزت عملية ترجمة Gradle/Kotlin حد الذاكرة المتاح في org.gradle.jvmargs.',
+      explanationEn: 'Gradle or Kotlin compiler exhausted JVM heap or metaspace memory.',
+      remediationAr: 'اضبط org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=768m في gradle.properties.',
+      remediationEn: 'Adjust org.gradle.jvmargs (e.g. -Xmx3g) in gradle.properties and retry.',
+      matchedLogExcerpt: extractExcerpt(text, /OutOfMemoryError|heap space|Metaspace/i),
     };
   }
 
@@ -83,16 +124,32 @@ export function classifyBuildFailure(params: {
     };
   }
 
-  if (/Failed to install the following Android SDK|compileSdkVersion|build-tools|SDK location not found|licenses? not accepted|NDK .* not found/i.test(text)) {
+  if (/Failed to install the following Android SDK|compileSdkVersion|build-tools|SDK location not found|licenses? not accepted|NDK .* not found|sdkmanager.*failed/i.test(text)) {
     return {
       code: 'ANDROID_SDK_CONFIG_ERROR',
       titleAr: 'خطأ في إعدادات Android SDK أو التراخيص',
       titleEn: 'Android SDK Configuration Error',
       explanationAr: 'تعذر تهيئة منصة Android SDK أو Build Tools أو NDK المطلوبة في المشروع.',
       explanationEn: 'Required Android SDK platform, Build Tools, or NDK failed to resolve or accept licenses.',
-      remediationAr: 'تأكد من قيم compileSdk / ndkVersion في build.gradle وأنها متوفرة في مستودع Android SDK.',
-      remediationEn: 'Verify compileSdk, buildToolsVersion, and ndkVersion in your Gradle build files.',
-      matchedLogExcerpt: extractExcerpt(text, /Android SDK|compileSdk|SDK location|license|NDK/i),
+      remediationAr: 'حدث ملف Workflow في صفحة التهيئة (تحديث تهيئة Android SDK التلقائية) وتأكد من compileSdk / ndkVersion.',
+      remediationEn: 'Update the workflow file from Configure and verify compileSdk / buildToolsVersion / ndkVersion.',
+      matchedLogExcerpt: extractExcerpt(
+        text,
+        /Error:.*sdkmanager|Failed to install.*Android SDK|licenses? not accepted|compileSdk|SDK location|NDK .* not found/i
+      ),
+    };
+  }
+
+  if (/File google-services\.json is missing/i.test(text)) {
+    return {
+      code: 'GOOGLE_SERVICES_MISSING',
+      titleAr: 'ملف google-services.json غير موجود',
+      titleEn: 'Missing google-services.json',
+      explanationAr: 'يطلب ملحق Google Services وجود app/google-services.json غير الموجود في المستودع.',
+      explanationEn: 'The Google Services Gradle plugin failed because app/google-services.json is missing.',
+      remediationAr: 'أضف google-services.json أو فعّل googleServices.missing.passthrough=true / MissingGoogleServicesStrategy.WARN.',
+      remediationEn: 'Commit google-services.json or configure MissingGoogleServicesStrategy.WARN in Gradle.',
+      matchedLogExcerpt: extractExcerpt(text, /google-services\.json/i),
     };
   }
 
@@ -101,11 +158,24 @@ export function classifyBuildFailure(params: {
       code: 'SIGNING_CREDENTIALS_ERROR',
       titleAr: 'خطأ في بيانات التوقيع أو Keystore',
       titleEn: 'Signing Credentials Error',
-      explanationAr: 'بيانات Keystore أو كلمات المرور أو Key Alias غير صحيحة أو مفقودة لبناء Release.',
-      explanationEn: 'Keystore file, alias, or passwords failed verification during Release signing.',
-      remediationAr: 'راجع كلمة مرور المخزن و Key Alias في إعدادات التوقيع أو ارفع ملف Keystore صحيح.',
-      remediationEn: 'Check your keystore file, key alias, and passwords in Signing Settings.',
-      matchedLogExcerpt: extractExcerpt(text, /keystore|signing|storePassword|apksigner/i),
+      explanationAr: 'ملف Keystore أو كلمات المرور أو Key Alias غير صحيحة أو مفقودة لبناء التطبيق.',
+      explanationEn: 'Keystore file, alias, or passwords failed verification during signing.',
+      remediationAr: 'راجع كلمة مرور المخزن و Key Alias أو استخدم وضع Debug أو ارفع شهادة توقيع صحيحة.',
+      remediationEn: 'Check keystore file, key alias, and passwords in Signing Settings or use Debug mode.',
+      matchedLogExcerpt: extractExcerpt(text, /Keystore file|Failed to read key|storePassword|apksigner|signingConfig/i),
+    };
+  }
+
+  if (/Manifest merger failed/i.test(text)) {
+    return {
+      code: 'MANIFEST_MERGER_ERROR',
+      titleAr: 'تعارض في دمج AndroidManifest.xml',
+      titleEn: 'AndroidManifest Merger Failed',
+      explanationAr: 'حدث تعارض بين خصائص AndroidManifest.xml في التطبيق والمكتبات المدمجة (مثل minSdk أو exported).',
+      explanationEn: 'AndroidManifest merger failed due to conflicting attributes or SDK requirements.',
+      remediationAr: 'راجع تفاصيل التعارض في السجل (مثل tools:replace أو android:exported أو minSdk).',
+      remediationEn: 'Inspect the manifest merger conflict in logs and adjust AndroidManifest.xml or minSdk.',
+      matchedLogExcerpt: extractExcerpt(text, /Manifest merger failed/i),
     };
   }
 
@@ -165,6 +235,6 @@ export function classifyBuildFailure(params: {
     explanationEn: 'The GitHub Actions workflow exited with a failure before producing a valid APK.',
     remediationAr: 'افحص سجل البناء الكامل لتحديد الخطوة التي تعثرت وأعد المحاولة.',
     remediationEn: 'Expand the build logs below to inspect the failed step and retry.',
-    matchedLogExcerpt: extractExcerpt(text, /error|failed|exception/i),
+    matchedLogExcerpt: extractExcerpt(text, /##\[error\]|Error:|FAILURE:|Exception:|failed/i),
   };
 }

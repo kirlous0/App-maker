@@ -108,9 +108,12 @@ export interface Dictionary {
     computedCommandLabel: string;
     workflowRequiredTitle: string;
     workflowRequiredDesc: string;
+    workflowUpdateTitle: string;
+    workflowUpdateDesc: string;
     workflowPermissionsNote: string;
     workflowApproveCheckbox: string;
     workflowInstallButton: string;
+    workflowUpdateButton: string;
     workflowInstalling: string;
     workflowInstalledBadge: string;
     buildButton: string;
@@ -131,6 +134,8 @@ export interface Dictionary {
     refreshNow: string;
     retrySameCommit: string;
     retryLatestCommit: string;
+    workflowUpdateRequiredError: string;
+    openConfigureToUpdate: string;
     viewDownloadPage: string;
     errorReportTitle: string;
     remediationLabel: string;
@@ -388,11 +393,15 @@ const ar: Dictionary = {
     workflowRequiredTitle: 'موافقة تثبيت سير عمل البناء (مرة واحدة)',
     workflowRequiredDesc:
       'لتشغيل البناء على GitHub Actions، يحتاج Repo2APK إلى إضافة ملف واحد فقط داخل المستودع دون المساس بأي workflows أخرى.',
+    workflowUpdateTitle: 'تحديث مطلوب لملف سير عمل البناء',
+    workflowUpdateDesc:
+      'تم تحديث قالب البناء لحل أخطاء إعداد Android SDK و Gradle و debug.keystore. راجع التحديث واعتمد تثبيته على هذا الفرع قبل البناء.',
     workflowPermissionsNote: 'الصلاحيات المستخدمة: Contents (Write) و Workflows (Write) و Actions (Write).',
-    workflowApproveCheckbox: 'راجعت محتوى ملف workflow وأوافق صراحة على إضافته إلى هذا المستودع.',
+    workflowApproveCheckbox: 'راجعت محتوى ملف workflow وأوافق صراحة على إضافته/تحديثه في هذا المستودع.',
     workflowInstallButton: 'تثبيت ملف Workflow في المستودع',
-    workflowInstalling: 'جارٍ إضافة workflow...',
-    workflowInstalledBadge: 'ملف repo2apk-build.yml مثبّت وجاهز',
+    workflowUpdateButton: 'اعتماد وتحديث ملف Workflow',
+    workflowInstalling: 'جارٍ حفظ workflow...',
+    workflowInstalledBadge: 'ملف repo2apk-build.yml مثبّت ومحدّث وجاهز',
     buildButton: 'بدء بناء APK الآن',
     startingBuild: 'جارٍ إرسال طلب البناء إلى GitHub Actions...',
   },
@@ -411,6 +420,8 @@ const ar: Dictionary = {
     refreshNow: 'تحديث الحالة الآن',
     retrySameCommit: 'إعادة البناء لنفس الـ Commit',
     retryLatestCommit: 'البناء لأحدث Commit',
+    workflowUpdateRequiredError: 'ملف workflow في المستودع قديم. افتح صفحة التهيئة واعتمد التحديث أولاً.',
+    openConfigureToUpdate: 'فتح صفحة التهيئة لتحديث Workflow',
     viewDownloadPage: 'الانتقال إلى صفحة تنزيل APK',
     errorReportTitle: 'تشخيص الفشل التلقائي',
     remediationLabel: 'الإجراء المقترح:',
@@ -691,11 +702,15 @@ const en: Dictionary = {
     workflowRequiredTitle: 'One-Time Build Workflow Approval',
     workflowRequiredDesc:
       'Repo2APK requires installing one dedicated workflow file on this branch without touching any existing workflows.',
+    workflowUpdateTitle: 'Build Workflow Update Available',
+    workflowUpdateDesc:
+      'The Repo2APK build workflow template has been updated with Android SDK, Gradle, and debug keystore fixes. Review and approve updating it on this branch before building.',
     workflowPermissionsNote: 'Permissions used: Contents (Write), Workflows (Write), Actions (Write).',
-    workflowApproveCheckbox: 'I have reviewed the workflow YAML below and explicitly approve adding it to this repository.',
+    workflowApproveCheckbox: 'I have reviewed the workflow YAML below and explicitly approve adding/updating it in this repository.',
     workflowInstallButton: 'Approve & Install Workflow',
+    workflowUpdateButton: 'Approve & Update Workflow',
     workflowInstalling: 'Committing workflow file...',
-    workflowInstalledBadge: 'repo2apk-build.yml installed',
+    workflowInstalledBadge: 'repo2apk-build.yml installed & up to date',
     buildButton: 'Build APK',
     startingBuild: 'Dispatching GitHub Actions build...',
   },
@@ -714,6 +729,8 @@ const en: Dictionary = {
     refreshNow: 'Sync Now',
     retrySameCommit: 'Rebuild Same Commit',
     retryLatestCommit: 'Build Latest Commit',
+    workflowUpdateRequiredError: 'The workflow file in this repository is outdated. Open Configure to approve the update first.',
+    openConfigureToUpdate: 'Open Configure to Update Workflow',
     viewDownloadPage: 'Go to APK Download Page',
     errorReportTitle: 'Automated Error Diagnosis',
     remediationLabel: 'Recommended Fix:',

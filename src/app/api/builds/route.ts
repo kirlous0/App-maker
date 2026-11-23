@@ -3,7 +3,7 @@ import { computeBuildCommand, sanitizeVersionValue } from '@/lib/android/command
 import { analyzeAndroidProject } from '@/lib/android/detector';
 import { classifyBuildFailure } from '@/lib/android/error-classifier';
 import { createInitialStagesState } from '@/lib/builds/stages';
-import { WORKFLOW_FILE_NAME, WORKFLOW_FILE_PATH } from '@/lib/builds/workflow-template';
+import { getRepo2ApkWorkflowYaml, WORKFLOW_FILE_NAME, WORKFLOW_FILE_PATH } from '@/lib/builds/workflow-template';
 import { decryptSecret, encryptSecret, generateNonce, sha256Hex } from '@/lib/crypto';
 import { dbStore } from '@/lib/db';
 import {
@@ -138,7 +138,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // Ensure workflow file exists on branch (never bypass explicit approval)
+    // Ensure workflow file exists and matches latest verified template (never bypass explicit approval)
     const workflowExists = await fetchRepoFileContent(
       token,
       owner,
@@ -151,6 +151,15 @@ export async function POST(request: Request) {
         {
           error: 'WORKFLOW_NOT_INSTALLED',
           message: `Required workflow ${WORKFLOW_FILE_PATH} must be approved and installed before building.`,
+        },
+        { status: 409 }
+      );
+    }
+    if (workflowExists.content.trim() !== getRepo2ApkWorkflowYaml().trim()) {
+      return NextResponse.json(
+        {
+          error: 'WORKFLOW_UPDATE_REQUIRED',
+          message: `Workflow ${WORKFLOW_FILE_PATH} in the repository is outdated and must be approved and updated before building.`,
         },
         { status: 409 }
       );
@@ -304,6 +313,7 @@ export async function POST(request: Request) {
         build_number: sanitizeVersionValue(body.buildNumber) || '',
         java_version: analysis.recommendedJdk || '17',
         flutter_version: analysis.flutterVersion || 'stable',
+        compile_sdk: analysis.androidSdk.compileSdk || '',
         use_repo2apk_secrets: useRepo2ApkSecrets ? 'true' : 'false',
       });
     } catch (dispatchErr) {

@@ -507,6 +507,22 @@ export const sqliteSandboxStore = {
     ).run(new Date().toISOString(), userId, repoFullName, branch, projectDir);
   },
 
+  async getProjectById(
+    userId: string,
+    projectId: string
+  ): Promise<{ id: string; analysis_json: unknown } | null> {
+    const db = getDb();
+    const row = db
+      .prepare('SELECT id, analysis_json FROM projects WHERE user_id = ? AND id = ?')
+      .get(userId, projectId) as { id: string; analysis_json: string } | undefined;
+    if (!row) return null;
+    try {
+      return { id: row.id, analysis_json: JSON.parse(row.analysis_json) };
+    } catch {
+      return { id: row.id, analysis_json: null };
+    }
+  },
+
   async listSigningConfigs(userId: string): Promise<SigningConfigSummary[]> {
     const db = getDb();
     return db
