@@ -5,6 +5,7 @@ import { extractApkFromGitHubArtifactZip, validateApkBuffer } from '@/lib/androi
 import { computeBuildCommand } from '@/lib/android/command-builder';
 import { analyzeAndroidProject, discoverCandidateProjectDirectories } from '@/lib/android/detector';
 import { classifyBuildFailure } from '@/lib/android/error-classifier';
+import { buildGitHubAppManifest, formatVercelGitHubAppEnv } from '@/lib/github/manifest';
 import {
   decryptSecret,
   encryptSecret,
@@ -301,5 +302,33 @@ describe('APK Validation & Error Classification', () => {
         framework: 'flutter',
       }).code
     ).toBe('FLUTTER_COMPILATION_ERROR');
+  });
+
+  it('builds GitHub App manifest and formats Vercel Import .env output safely', () => {
+    const manifest = buildGitHubAppManifest('https://repo2apk.vercel.app', 'Repo2APK Test');
+    expect(manifest.redirect_url).toBe('https://repo2apk.vercel.app/api/github/manifest/callback');
+    expect(manifest.callback_urls).toEqual(['https://repo2apk.vercel.app/api/auth/github/callback']);
+    expect(manifest.default_permissions).toEqual({
+      actions: 'write',
+      contents: 'write',
+      metadata: 'read',
+      secrets: 'write',
+      workflows: 'write',
+    });
+
+    const envText = formatVercelGitHubAppEnv({
+      id: 12345,
+      slug: 'repo2apk-test',
+      client_id: 'Iv1.abc123',
+      client_secret: 'secret_xyz',
+      pem: '-----BEGIN RSA PRIVATE KEY-----\nLINE1\nLINE2\n-----END RSA PRIVATE KEY-----\n',
+      webhook_secret: 'whsec_789',
+    });
+    expect(envText).toContain('GITHUB_APP_ID=12345\n');
+    expect(envText).toContain('GITHUB_APP_SLUG=repo2apk-test\n');
+    expect(envText).toContain(
+      'GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\\nLINE1\\nLINE2\\n-----END RSA PRIVATE KEY-----"\n'
+    );
+    expect(envText).toContain('GITHUB_WEBHOOK_SECRET=whsec_789\n');
   });
 });

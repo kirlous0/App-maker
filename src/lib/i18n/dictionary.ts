@@ -201,6 +201,11 @@ export interface Dictionary {
     callbackUrlLabel: string;
     webhookUrlLabel: string;
     permissionsTableTitle: string;
+    manifestCardTitle: string;
+    manifestCardDesc: string;
+    manifestAppNameLabel: string;
+    manifestSubmitButton: string;
+    manifestSubmitting: string;
     preferencesTitle: string;
     languageLabel: string;
     defaultBuildTypeLabel: string;
@@ -497,6 +502,12 @@ const ar: Dictionary = {
     callbackUrlLabel: 'Callback URL',
     webhookUrlLabel: 'Webhook URL',
     permissionsTableTitle: 'الحد الأدنى المطلوب من الصلاحيات:',
+    manifestCardTitle: 'إعداد تلقائي بضغطة زر (GitHub App Manifest -> ملف .env لـ Vercel)',
+    manifestCardDesc:
+      'بدلاً من كتابة الروابط والصلاحيات يدوياً، اضغط الزر بالأسفل لإنشاء التطبيق على GitHub تلقائياً وتنزيل ملف .env جاهز لزر Import .env في Vercel.',
+    manifestAppNameLabel: 'اسم التطبيق على GitHub (فريد)',
+    manifestSubmitButton: 'إنشاء GitHub App تلقائياً وتجهيز ملف .env',
+    manifestSubmitting: 'جارٍ التوجيه إلى GitHub...',
     preferencesTitle: 'تفضيلات البناء واللغة',
     languageLabel: 'لغة الواجهة',
     defaultBuildTypeLabel: 'نوع البناء الافتراضي',
@@ -794,6 +805,12 @@ const en: Dictionary = {
     callbackUrlLabel: 'Callback URL',
     webhookUrlLabel: 'Webhook URL',
     permissionsTableTitle: 'Minimum Required GitHub App Permissions:',
+    manifestCardTitle: '1-Click Automatic Setup (GitHub App Manifest -> Vercel .env)',
+    manifestCardDesc:
+      'Skip filling out URLs and permissions manually. Click below to register the GitHub App automatically and download a ready-to-import .env file for Vercel.',
+    manifestAppNameLabel: 'Unique GitHub App Name',
+    manifestSubmitButton: 'Create GitHub App & Export .env',
+    manifestSubmitting: 'Redirecting to GitHub...',
     preferencesTitle: 'Language & Build Preferences',
     languageLabel: 'Interface Language',
     defaultBuildTypeLabel: 'Default Build Type',

@@ -5,6 +5,7 @@ import type { SupportedLanguage } from '@/lib/types';
 
 export const SESSION_COOKIE_NAME = 'repo2apk_session';
 export const OAUTH_STATE_COOKIE_NAME = 'repo2apk_oauth_state';
+export const MANIFEST_STATE_COOKIE_NAME = 'repo2apk_manifest_state';
 export const LANG_COOKIE_NAME = 'repo2apk_lang';
 
 function isProductionSecure(request?: Request): boolean {
@@ -70,6 +71,33 @@ export async function consumeOAuthStateCookie(
     return { valid: false, returnTo: '/dashboard' };
   }
   return { valid: true, returnTo: parsed.returnTo || '/dashboard' };
+}
+
+export function setManifestStateCookie(
+  response: NextResponse,
+  state: string,
+  request?: Request
+): void {
+  const signed = signGenericToken({ state, kind: 'manifest' }, 1800);
+  response.cookies.set(MANIFEST_STATE_COOKIE_NAME, signed, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isProductionSecure(request),
+    path: '/',
+    maxAge: 1800,
+  });
+}
+
+export async function consumeManifestStateCookie(expectedState: string | null): Promise<boolean> {
+  const store = await cookies();
+  const raw = store.get(MANIFEST_STATE_COOKIE_NAME)?.value;
+  const parsed = verifyGenericToken<{ state: string; kind?: string }>(raw);
+  return Boolean(
+    parsed &&
+      parsed.kind === 'manifest' &&
+      expectedState &&
+      parsed.state === expectedState
+  );
 }
 
 export async function getSession(): Promise<{ userId: string; githubLogin: string } | null> {

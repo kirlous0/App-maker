@@ -65,6 +65,46 @@ export function SettingsClient({
   const [signingErr, setSigningErr] = useState<string | null>(null);
   const [savingKeystore, setSavingKeystore] = useState(false);
 
+  const [manifestAppName, setManifestAppName] = useState('Repo2APK Builder');
+  const [manifestSubmitting, setManifestSubmitting] = useState(false);
+  const [manifestErr, setManifestErr] = useState<string | null>(null);
+
+  const handleStartManifest = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setManifestSubmitting(true);
+    setManifestErr(null);
+    try {
+      const res = await fetch('/api/github/manifest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ appName: manifestAppName }),
+      });
+      const data = (await res.json()) as {
+        actionUrl?: string;
+        manifestJson?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.actionUrl || !data.manifestJson) {
+        setManifestErr(data.error || 'Failed to prepare GitHub App manifest.');
+        setManifestSubmitting(false);
+        return;
+      }
+      const form = document.createElement('form');
+      form.method = 'POST';
+      form.action = data.actionUrl;
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = 'manifest';
+      input.value = data.manifestJson;
+      form.appendChild(input);
+      document.body.appendChild(form);
+      form.submit();
+    } catch {
+      setManifestErr('Network error preparing GitHub App manifest.');
+      setManifestSubmitting(false);
+    }
+  };
+
   const handleSavePrefs = async (e: React.FormEvent) => {
     e.preventDefault();
     setSavingPrefs(true);
@@ -252,6 +292,50 @@ export function SettingsClient({
         </div>
 
         <p className="text-xs sm:text-sm text-[#9AA3B2]">{dict.settings.githubSetupDesc}</p>
+
+        {!githubApp.isConfigured && (
+          <form
+            onSubmit={handleStartManifest}
+            className="rounded-md border border-emerald-500/35 bg-emerald-500/5 p-4 space-y-3"
+          >
+            <div className="space-y-1">
+              <div className="text-sm font-semibold text-emerald-300">
+                {dict.settings.manifestCardTitle}
+              </div>
+              <p className="text-xs text-[#CBD2E0]">{dict.settings.manifestCardDesc}</p>
+            </div>
+            {manifestErr && (
+              <div className="rounded border border-red-500/40 bg-red-500/10 p-2 text-xs text-red-300">
+                {manifestErr}
+              </div>
+            )}
+            <div className="flex flex-col sm:flex-row sm:items-end gap-3">
+              <div className="flex-1 space-y-1 text-xs">
+                <label className="text-[#9AA3B2]">{dict.settings.manifestAppNameLabel}</label>
+                <input
+                  type="text"
+                  required
+                  value={manifestAppName}
+                  onChange={(e) => setManifestAppName(e.target.value)}
+                  className="w-full rounded border border-[#2E3648] bg-[#08090C] px-3 py-2 font-mono text-white"
+                  dir="ltr"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={manifestSubmitting}
+                className="inline-flex items-center justify-center gap-2 rounded-md bg-emerald-500 px-4 py-2 text-xs font-semibold text-[#04140E] hover:bg-emerald-400 disabled:opacity-60"
+              >
+                <GitHubIcon className="h-4 w-4" />
+                <span>
+                  {manifestSubmitting
+                    ? dict.settings.manifestSubmitting
+                    : dict.settings.manifestSubmitButton}
+                </span>
+              </button>
+            </div>
+          </form>
+        )}
 
         {githubApp.missingVars.length > 0 && (
           <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs space-y-1.5">
