@@ -244,6 +244,72 @@ android {
     });
     expect(cmd.command).toBe('./gradlew :app:assembleDebug --no-daemon');
   });
+
+  it('detects pure Java Android projects (with gradle.properties and optional missing gradlew)', async () => {
+    const files: Record<string, string> = {
+      'settings.gradle': "include ':app'",
+      'gradle.properties': 'compileSdkVersion=34\nminSdkVersion=24\ntargetSdkVersion=34',
+      'app/build.gradle': `
+        apply plugin: 'com.android.application'
+        android {
+          namespace "com.acme.javaapp"
+          compileSdkVersion project.properties.compileSdkVersion.toInteger()
+          defaultConfig {
+            applicationId "com.acme.javaapp"
+            minSdkVersion project.properties.minSdkVersion.toInteger()
+            targetSdkVersion project.properties.targetSdkVersion.toInteger()
+          }
+        }
+      `,
+      'app/src/main/AndroidManifest.xml': '<manifest package="com.acme.javaapp"/>',
+    };
+
+    const analysis = await analyzeAndroidProject({
+      repoFullName: 'acme/java-android',
+      branch: 'main',
+      commitSha: '1111222233334444',
+      projectDir: '.',
+      treePaths: [...Object.keys(files), 'app/src/main/java/com/acme/MainActivity.java'],
+      fetchFile: async (p) => files[p] ?? null,
+    });
+
+    expect(analysis.isAndroidProject).toBe(true);
+    expect(analysis.isBuildable).toBe(true);
+    expect(analysis.framework).toBe('native_android');
+    expect(analysis.language).toBe('Java');
+    expect(analysis.packageId).toBe('com.acme.javaapp');
+    expect(analysis.androidSdk.compileSdk).toBe('34');
+    expect(analysis.androidSdk.minSdk).toBe('24');
+    expect(analysis.hasGradleWrapper).toBe(false);
+    expect(analysis.warnings.some((w) => w.code === 'MISSING_GRADLE_WRAPPER')).toBe(true);
+
+    const cmd = computeBuildCommand({ analysis, buildType: 'debug' });
+    expect(cmd.command).toBe('gradle :app:assembleDebug --no-daemon');
+  });
+
+  it('classifies README-only repos and standard Java non-Android repos accurately', async () => {
+    const readmeOnly = await analyzeAndroidProject({
+      repoFullName: 'kirlous0/Ultra',
+      branch: 'main',
+      commitSha: '6249e392',
+      projectDir: '.',
+      treePaths: ['README.md'],
+      fetchFile: async () => '# Ultra',
+    });
+    expect(readmeOnly.isBuildable).toBe(false);
+    expect(readmeOnly.nonAndroidReason?.code).toBe('EMPTY_OR_README_ONLY_REPOSITORY');
+
+    const javaServer = await analyzeAndroidProject({
+      repoFullName: 'acme/java-cli',
+      branch: 'main',
+      commitSha: '55556666',
+      projectDir: '.',
+      treePaths: ['pom.xml', 'src/main/java/App.java'],
+      fetchFile: async () => '<project/>',
+    });
+    expect(javaServer.isBuildable).toBe(false);
+    expect(javaServer.nonAndroidReason?.code).toBe('JAVA_NON_ANDROID_PROJECT');
+  });
 });
 
 describe('APK Validation & Error Classification', () => {

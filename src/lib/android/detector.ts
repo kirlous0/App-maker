@@ -40,9 +40,9 @@ export function discoverCandidateProjectDirectories(treePaths: string[]): string
     } else if (
       (file === 'build.gradle' || file === 'build.gradle.kts') &&
       parts.length >= 2 &&
-      parts[parts.length - 2] === 'android'
+      (parts[parts.length - 2] === 'android' || parts[parts.length - 2] === 'app')
     ) {
-      // e.g. my-app/android/build.gradle -> candidate root is my-app (or . if top-level android/)
+      // e.g. my-app/android/build.gradle or my-app/app/build.gradle -> candidate root is my-app (or .)
       const parent = parts.length === 2 ? '.' : parts.slice(0, -2).join('/');
       candidates.add(parent);
     }
@@ -64,10 +64,11 @@ function parseGradleWrapperVersion(propsContent: string | null): string | null {
 
 function parseSettingsModules(settingsContent: string | null): string[] {
   if (!settingsContent) return [];
+  const cleaned = settingsContent.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
   const modules = new Set<string>();
-  const includeRegex = /include\s*\(([^)]+)\)|include\s+([^\r\n]+)/g;
+  const includeRegex = /include\s*\(([\s\S]*?)\)|include\s+((?:[^\r\n\\]|\\\r?\n|,\s*\r?\n)+)/g;
   let m: RegExpExecArray | null;
-  while ((m = includeRegex.exec(settingsContent)) !== null) {
+  while ((m = includeRegex.exec(cleaned)) !== null) {
     const raw = (m[1] || m[2] || '').trim();
     const quoted = raw.matchAll(/["']([^"']+)["']/g);
     for (const q of quoted) {
@@ -80,9 +81,36 @@ function parseSettingsModules(settingsContent: string | null): string[] {
   return Array.from(modules);
 }
 
-function parseGradleStringProp(content: string, names: string[]): string | null {
+function parseGradleProperties(propsContent: string | null): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!propsContent) return result;
+  for (const rawLine of propsContent.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#') || line.startsWith('!')) continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    const val = line.slice(eq + 1).trim();
+    if (key) result[key] = val;
+  }
+  return result;
+}
+
+function parseGradleStringProp(
+  content: string,
+  names: string[],
+  tomlVersions: Record<string, string> = {},
+  gradleProps: Record<string, string> = {}
+): string | null {
   for (const name of names) {
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Match AGP 9 block syntax: compileSdk { version = release(35) }
+    if (name === 'compileSdk' || name === 'minSdk' || name === 'targetSdk') {
+      const blockMatch = content.match(
+        new RegExp(`\\b${escaped}\\s*\\{[\\s\\S]{0,160}?release\\(\\s*([0-9]{1,3})\\s*\\)`)
+      );
+      if (blockMatch?.[1]) return blockMatch[1].trim();
+    }
     // Match Kotlin/Groovy: prop = "val" OR prop "val" OR prop = 34 OR prop(34) OR prop = flutter.compileSdkVersion
     const strMatch = content.match(
       new RegExp(`\\b${escaped}\\s*(?:=|\\s)\\s*["']([^"']+)["']`)
@@ -96,6 +124,22 @@ function parseGradleStringProp(content: string, names: string[]): string | null 
       new RegExp(`\\b${escaped}\\s*(?:=|\\s)\\s*(flutter\\.[A-Za-z0-9_]+)`)
     );
     if (flutterRef?.[1]) return flutterRef[1].trim();
+    // Match Version Catalog: libs.versions.compileSdk.get().toInt()
+    const libsMatch = content.match(
+      new RegExp(`\\b${escaped}\\s*(?:=|\\s|\\()\\s*libs\\.versions\\.([A-Za-z0-9_.-]+?)(?:\\.get\\(\\))?(?:\\.toInt\\(\\))?(?:\\)|\\s|$)`)
+    );
+    if (libsMatch?.[1]) {
+      const k = libsMatch[1].replace(/\./g, '-');
+      const v = tomlVersions[libsMatch[1]] || tomlVersions[k];
+      if (v) return v;
+    }
+    // Match gradle.properties references: project.properties.compileSdkVersion.toInteger() or CONSTANT
+    const propRefMatch = content.match(
+      new RegExp(`\\b${escaped}\\s*(?:=|\\s)\\s*(?:project\\.properties\\.)?([A-Za-z_][A-Za-z0-9_]*)(?:\\.toInteger\\(\\))?`)
+    );
+    if (propRefMatch?.[1] && gradleProps[propRefMatch[1]]) {
+      return gradleProps[propRefMatch[1]];
+    }
   }
   return null;
 }
@@ -104,17 +148,33 @@ function parseVersionCatalogAgp(tomlContent: string | null): {
   agpVersion: string | null;
   kotlinVersion: string | null;
   appPluginAlias: string | null;
+  versions: Record<string, string>;
 } {
-  if (!tomlContent) return { agpVersion: null, kotlinVersion: null, appPluginAlias: null };
+  if (!tomlContent) {
+    return { agpVersion: null, kotlinVersion: null, appPluginAlias: null, versions: {} };
+  }
+  const versions: Record<string, string> = {};
+  const versionsSection = tomlContent.match(/\[versions\]([\s\S]*?)(?:\n\[[^\]]+\]|$)/);
+  if (versionsSection?.[1]) {
+    for (const line of versionsSection[1].split(/\r?\n/)) {
+      const m = line.match(/^\s*([A-Za-z0-9_-]+)\s*=\s*["']([^"']+)["']/);
+      if (m?.[1] && m?.[2]) versions[m[1]] = m[2];
+    }
+  }
   const agpMatch = tomlContent.match(/^(?:agp|androidGradlePlugin|gradle)\s*=\s*["']([^"']+)["']/m);
   const kotlinMatch = tomlContent.match(/^kotlin\s*=\s*["']([^"']+)["']/m);
-  const aliasMatch = tomlContent.match(
-    /^([A-Za-z0-9_-]+)\s*=\s*\{[^}]*id\s*=\s*["']com\.android\.application["']/m
-  );
+  const aliasMatch =
+    tomlContent.match(
+      /^["']?([A-Za-z0-9_-]+)["']?\s*=\s*\{[^}]*id\s*=\s*["']com\.android\.application["']/m
+    ) ||
+    tomlContent.match(
+      /^["']?([A-Za-z0-9_-]+)["']?\s*=\s*["']com\.android\.application(?::[^"']+)?["']/m
+    );
   return {
-    agpVersion: agpMatch?.[1] || null,
-    kotlinVersion: kotlinMatch?.[1] || null,
+    agpVersion: agpMatch?.[1] || versions.agp || versions.androidGradlePlugin || null,
+    kotlinVersion: kotlinMatch?.[1] || versions.kotlin || null,
     appPluginAlias: aliasMatch?.[1]?.replace(/-/g, '.') || null,
+    versions,
   };
 }
 
@@ -591,6 +651,7 @@ export async function analyzeAndroidProject(params: {
   const hasRootGradleKts = hasFile('build.gradle.kts');
   const hasRootGradleGroovy = hasFile('build.gradle');
   const hasAppGradle = hasFile('app/build.gradle.kts') || hasFile('app/build.gradle');
+  let detectedAndroidLibraryOnly = false;
 
   if (hasSettingsKts || hasSettingsGroovy || hasRootGradleKts || hasRootGradleGroovy || hasAppGradle) {
     const settingsRaw =
@@ -600,11 +661,13 @@ export async function analyzeAndroidProject(params: {
       (await params.fetchFile(joinDir(projectDir, 'build.gradle.kts'))) ||
       (await params.fetchFile(joinDir(projectDir, 'build.gradle')));
     const toml = await params.fetchFile(joinDir(projectDir, 'gradle/libs.versions.toml'));
+    const rootGradlePropsRaw = await params.fetchFile(joinDir(projectDir, 'gradle.properties'));
     const gradleProps = await params.fetchFile(
       joinDir(projectDir, 'gradle/wrapper/gradle-wrapper.properties')
     );
 
     const catalog = parseVersionCatalogAgp(toml);
+    const parsedProps = parseGradleProperties(rootGradlePropsRaw);
     const parsedModules = parseSettingsModules(settingsRaw);
 
     // Discover potential modules in tree if settings.gradle didn't list them explicitly
@@ -633,14 +696,21 @@ export async function analyzeAndroidProject(params: {
       if (!modGradle) continue;
       allModuleContents.push(modGradle);
 
+      const hasManifest = hasFile(`${modPrefix}src/main/AndroidManifest.xml`);
+      const isLibraryOnly = /com\.android\.library/.test(modGradle) && !/com\.android\.application/.test(modGradle);
+      if (isLibraryOnly) detectedAndroidLibraryOnly = true;
+
       const isAppPlugin =
-        /com\.android\.application/.test(modGradle) ||
-        (catalog.appPluginAlias ? modGradle.includes(catalog.appPluginAlias) : false);
+        /com\.android\.application|com\.android\.build\.gradle\.AppPlugin/.test(modGradle) ||
+        (catalog.appPluginAlias ? modGradle.includes(catalog.appPluginAlias) : false) ||
+        (!isLibraryOnly &&
+          /(?:android\s*\{|configure<\s*ApplicationExtension\s*>)/.test(modGradle) &&
+          (/\bapplicationId\b/.test(modGradle) || hasManifest));
 
       if (isAppPlugin) {
-        const manifest = await params.fetchFile(
-          joinDir(projectDir, `${modPrefix}src/main/AndroidManifest.xml`)
-        );
+        const manifest = hasManifest
+          ? await params.fetchFile(joinDir(projectDir, `${modPrefix}src/main/AndroidManifest.xml`))
+          : null;
         appModules.push({
           name: modDir === '.' ? 'root' : modDir.replace(/\//g, ':'),
           content: modGradle,
@@ -649,24 +719,29 @@ export async function analyzeAndroidProject(params: {
       }
     }
 
-    const isAndroidPluginInRoot = Boolean(
+    const isRootAppPlugin = Boolean(
       rootGradle &&
-        (/com\.android\.application|com\.android\.library/.test(rootGradle) ||
+        (/com\.android\.application|com\.android\.build\.gradle\.AppPlugin/.test(rootGradle) ||
           (catalog.appPluginAlias && rootGradle.includes(catalog.appPluginAlias)))
     );
+    if (rootGradle && /com\.android\.library/.test(rootGradle) && !isRootAppPlugin) {
+      detectedAndroidLibraryOnly = true;
+    }
 
-    if (appModules.length > 0 || isAndroidPluginInRoot) {
+    if (appModules.length > 0 || isRootAppPlugin) {
       const primary = appModules[0] || {
-        name: 'app',
+        name: 'root',
         content: rootGradle || '',
         manifest: await params.fetchFile(joinDir(projectDir, 'src/main/AndroidManifest.xml')),
       };
       const hasGradleWrapper = hasFile('gradlew');
       if (!hasGradleWrapper) {
-        blockers.push({
+        warnings.push({
           code: 'MISSING_GRADLE_WRAPPER',
-          messageAr: 'لم يتم العثور على سكربت ./gradlew في جذر المشروع.',
-          messageEn: 'Gradle wrapper script (./gradlew) is missing in this project directory.',
+          messageAr:
+            'لم يتم العثور على سكربت ./gradlew في جذر المشروع؛ سيحاول مسار GitHub Actions تهيئة Wrapper أو استخدام Gradle المثبّت تلقائياً.',
+          messageEn:
+            'Gradle wrapper script (./gradlew) is missing; GitHub Actions will fall back to generating a wrapper or running system Gradle.',
         });
       }
 
@@ -688,7 +763,7 @@ export async function analyzeAndroidProject(params: {
       let extraSdkText = primaryGradle;
       // Check convention plugin files (e.g., build-logic/.../AndroidApplicationConventionPlugin.kt or KotlinAndroid.kt)
       // if primary module relies on a convention plugin for compileSdk/minSdk/targetSdk
-      if (!parseGradleStringProp(extraSdkText, ['compileSdk', 'compileSdkVersion'])) {
+      if (!parseGradleStringProp(extraSdkText, ['compileSdk', 'compileSdkVersion'], catalog.versions, parsedProps)) {
         const conventionFiles = params.treePaths
           .filter((p) => {
             if (prefixSlash && !p.startsWith(prefixSlash)) return false;
@@ -711,14 +786,15 @@ export async function analyzeAndroidProject(params: {
       const { buildTypes, productFlavors } = parseBuildTypesAndFlavors(primaryGradle);
       const manifestInfo = parseManifestInfo(primary.manifest);
       const packageId =
-        parseGradleStringProp(primaryGradle, ['applicationId', 'namespace']) || manifestInfo.packageId;
+        parseGradleStringProp(primaryGradle, ['applicationId', 'namespace'], catalog.versions, parsedProps) ||
+        manifestInfo.packageId;
 
       const androidSdk: AndroidSdkRequirements = {
-        compileSdk: parseGradleStringProp(extraSdkText, ['compileSdk', 'compileSdkVersion']),
-        minSdk: parseGradleStringProp(extraSdkText, ['minSdk', 'minSdkVersion']),
-        targetSdk: parseGradleStringProp(extraSdkText, ['targetSdk', 'targetSdkVersion']),
-        ndkVersion: parseGradleStringProp(extraSdkText, ['ndkVersion']),
-        buildToolsVersion: parseGradleStringProp(extraSdkText, ['buildToolsVersion']),
+        compileSdk: parseGradleStringProp(extraSdkText, ['compileSdk', 'compileSdkVersion'], catalog.versions, parsedProps),
+        minSdk: parseGradleStringProp(extraSdkText, ['minSdk', 'minSdkVersion'], catalog.versions, parsedProps),
+        targetSdk: parseGradleStringProp(extraSdkText, ['targetSdk', 'targetSdkVersion'], catalog.versions, parsedProps),
+        ndkVersion: parseGradleStringProp(extraSdkText, ['ndkVersion'], catalog.versions, parsedProps),
+        buildToolsVersion: parseGradleStringProp(extraSdkText, ['buildToolsVersion'], catalog.versions, parsedProps),
       };
 
       const existingSigning = detectSigningConfig(gradleTexts);
@@ -752,11 +828,11 @@ export async function analyzeAndroidProject(params: {
         flutterVersion: null,
         reactNativeVersion: null,
         expoVersion: null,
-        applicationModules: appModules.map((m) => m.name),
+        applicationModules: appModules.length > 0 ? appModules.map((m) => m.name) : [primary.name],
         selectedModule: primary.name,
         packageId,
-        versionName: parseGradleStringProp(primaryGradle, ['versionName']),
-        versionCode: parseGradleStringProp(primaryGradle, ['versionCode']),
+        versionName: parseGradleStringProp(primaryGradle, ['versionName'], catalog.versions, parsedProps),
+        versionCode: parseGradleStringProp(primaryGradle, ['versionCode'], catalog.versions, parsedProps),
         buildTypes,
         productFlavors,
         availableVariants: computeVariants(buildTypes, productFlavors),
@@ -774,11 +850,64 @@ export async function analyzeAndroidProject(params: {
 
   // 4. Not an Android application
   const prefixSlash = projectDir === '.' ? '' : `${projectDir}/`;
-  const topFiles = params.treePaths
-    .filter((p) => !prefixSlash || p.startsWith(prefixSlash))
+  const scopedPaths = params.treePaths.filter((p) => !prefixSlash || p.startsWith(prefixSlash));
+  const topFiles = scopedPaths
     .map((p) => (prefixSlash ? p.slice(prefixSlash.length) : p))
     .filter((p) => !p.includes('/'))
     .slice(0, 12);
+
+  const hasAnyCodeOrBuildFile = scopedPaths.some((p) =>
+    /\.(java|kt|kts|gradle|dart|js|jsx|ts|tsx|xml|yaml|yml|json)$/i.test(p) &&
+    !/(^|\/)(README\.md|LICENSE|\.gitignore)$/i.test(p)
+  );
+  const hasJavaOrJvmNonAndroid =
+    scopedPaths.some((p) => p.endsWith('.java') || p.endsWith('/pom.xml') || p === 'pom.xml') ||
+    hasRootGradleKts ||
+    hasRootGradleGroovy;
+  const hasAltCandidateDir =
+    candidateDirectories.length > 1 || (candidateDirectories.length === 1 && candidateDirectories[0] !== projectDir);
+
+  let blockerCode = 'NOT_ANDROID_REPOSITORY';
+  let blockerAr =
+    'لم يتم العثور على مشروع أندرويد فعلي (Native Kotlin/Java أو Flutter Android أو React Native Android) في هذا المجلد. لا تقوم المنصة بتغليف المواقع داخل WebView.';
+  let blockerEn =
+    'No actual Android application (Native Gradle, Flutter android/, or React Native android/) was detected in this directory. Repo2APK never creates WebView wrappers.';
+  let reasonAr = hasAltCandidateDir
+    ? 'المجلد المحدد لا يحتوي على مشروع أندرويد؛ جرّب اختيار مجلد فرعي آخر من قائمة المجلدات المكتشفة.'
+    : 'هذا المستودع لا يحتوي على شيفرة مصدرية لتطبيق أندرويد.';
+  let reasonEn =
+    'This repository or selected directory does not contain Android build configuration files (build.gradle / build.gradle.kts / pubspec.yaml + android/).';
+
+  if (detectedAndroidLibraryOnly) {
+    blockerCode = 'ANDROID_LIBRARY_ONLY';
+    blockerAr =
+      'تم رصد وحدة مكتبة أندرويد (com.android.library) فقط بدون أي وحدة تطبيق (com.android.application) قابلة للبناء إلى APK.';
+    blockerEn =
+      'Only an Android Library module (com.android.library) was found, with no com.android.application module that outputs an installable APK.';
+    reasonAr = blockerAr;
+    reasonEn = blockerEn;
+  } else if (!hasAnyCodeOrBuildFile) {
+    blockerCode = 'EMPTY_OR_README_ONLY_REPOSITORY';
+    blockerAr =
+      'هذا المستودع (أو الفرع المحدد) يحتوي فقط على ملفات وصفية مثل README.md ولا توجد أي شيفرة مصدرية أو ملفات Java/Gradle مرفوعة على GitHub بعد.';
+    blockerEn =
+      'This repository/branch only contains placeholder/readme files (such as README.md) with no source or Gradle files pushed to GitHub yet.';
+    reasonAr =
+      'ارفع (git push) ملفات مشروع الأندرويد الكاملة إلى هذا المستودع والفرع على GitHub ثم أعد التحليل، أو تأكد من اختيار المستودع الصحيح من لوحة التحكم.';
+    reasonEn =
+      'Push your Android project files to this GitHub repository/branch and re-analyze, or choose the repository that holds your source code.';
+  } else if (hasJavaOrJvmNonAndroid) {
+    blockerCode = 'JAVA_NON_ANDROID_PROJECT';
+    blockerAr =
+      'تم رصد مشروع Java قياسي بدون إعدادات تطبيق أندرويد (com.android.application وAndroidManifest.xml). لا يمكن تحويل مشاريع Java المكتبية أو الخلفية إلى APK تلقائياً.';
+    blockerEn =
+      'Detected a standard Java/JVM project without Android Application Gradle configuration (com.android.application / AndroidManifest.xml). Desktop or backend Java projects cannot be compiled directly into an Android APK.';
+    reasonAr = hasAltCandidateDir
+      ? 'إذا كان تطبيق الأندرويد داخل مجلد فرعي، اختره من قائمة «مجلد المشروع» بالأعلى. أما إذا كان مشروع Java عادياً، فيلزم هيكل Android Gradle (مثل app/build.gradle وAndroidManifest.xml).'
+      : 'يلزم وجود هيكل مشروع Android Gradle فعلي (com.android.application وAndroidManifest.xml) حتى يمكن بناء ملف APK.';
+    reasonEn =
+      'An actual Android Gradle application structure (com.android.application and AndroidManifest.xml) is required to build an APK.';
+  }
 
   return {
     repoFullName: params.repoFullName,
@@ -789,7 +918,7 @@ export async function analyzeAndroidProject(params: {
     isBuildable: false,
     framework: 'unsupported',
     frameworkLabel: 'Not an Android Application',
-    language: 'Unknown',
+    language: hasJavaOrJvmNonAndroid ? 'Java (Non-Android)' : 'Unknown',
     buildSystem: 'Unsupported / Non-Android',
     agpVersion: null,
     gradleWrapperVersion: null,
@@ -826,22 +955,16 @@ export async function analyzeAndroidProject(params: {
     supportsBuildNameNumberOverride: false,
     blockers: [
       {
-        code: 'NOT_ANDROID_REPOSITORY',
-        messageAr:
-          'لم يتم العثور على مشروع أندرويد فعلي (Native Kotlin/Java أو Flutter Android أو React Native Android) في هذا المجلد. لا تقوم المنصة بتغليف المواقع داخل WebView.',
-        messageEn:
-          'No actual Android application (Native Gradle, Flutter android/, or React Native android/) was detected in this directory. Repo2APK never creates WebView wrappers.',
+        code: blockerCode,
+        messageAr: blockerAr,
+        messageEn: blockerEn,
       },
     ],
     warnings: [],
     nonAndroidReason: {
-      code: 'NOT_ANDROID_REPOSITORY',
-      messageAr:
-        candidateDirectories.length > 1 || (candidateDirectories.length === 1 && candidateDirectories[0] !== projectDir)
-          ? 'المجلد المحدد لا يحتوي على مشروع أندرويد؛ جرّب اختيار مجلد فرعي آخر من قائمة المجلدات المكتشفة.'
-          : 'هذا المستودع لا يحتوي على شيفرة مصدرية لتطبيق أندرويد.',
-      messageEn:
-        'This repository or selected directory does not contain Android build configuration files (build.gradle / build.gradle.kts / pubspec.yaml + android/).',
+      code: blockerCode,
+      messageAr: reasonAr,
+      messageEn: reasonEn,
       detectedFiles: topFiles,
     },
   };

@@ -71,32 +71,74 @@ export function BuildMonitorClient({
     return () => clearInterval(timer);
   }, [isActive]);
 
-  // Real-time SSE connection to GitHub Actions sync stream
+  // Real-time SSE connection to GitHub Actions sync stream with automatic polling fallback
   useEffect(() => {
     if (!isActive) return;
-    const es = new EventSource(`/api/builds/${job.id}/stream`);
-    es.addEventListener('update', (event) => {
-      try {
-        const payload = JSON.parse((event as MessageEvent).data) as {
-          build?: BuildJobRecord;
-          logs?: BuildLogRecord[];
-          artifact?: BuildArtifactRecord | null;
-        };
-        if (payload.build) setJob(payload.build);
-        if (payload.logs) setLogs(payload.logs);
-        if (payload.artifact !== undefined) setArtifact(payload.artifact);
-      } catch {
-        // ignore parse errors
-      }
-    });
-    es.addEventListener('done', () => {
-      es.close();
-    });
-    es.onerror = () => {
-      es.close();
+    let cancelled = false;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let es: EventSource | null = null;
+
+    const startPollingFallback = () => {
+      if (cancelled || pollTimer) return;
+      const pollOnce = async () => {
+        if (cancelled) return;
+        try {
+          const res = await fetch(`/api/builds/${job.id}/sync`, { method: 'POST' });
+          if (!res.ok) return;
+          const payload = (await res.json()) as {
+            build?: BuildJobRecord;
+            logs?: BuildLogRecord[];
+            artifact?: BuildArtifactRecord | null;
+          };
+          if (payload.build) setJob(payload.build);
+          if (payload.logs) setLogs(payload.logs);
+          if (payload.artifact !== undefined) setArtifact(payload.artifact);
+        } catch {
+          // ignore transient poll errors
+        }
+      };
+      void pollOnce();
+      pollTimer = setInterval(() => {
+        void pollOnce();
+      }, 6000);
     };
+
+    const connectSse = () => {
+      if (cancelled) return;
+      es = new EventSource(`/api/builds/${job.id}/stream`);
+      es.addEventListener('update', (event) => {
+        try {
+          const payload = JSON.parse((event as MessageEvent).data) as {
+            build?: BuildJobRecord;
+            logs?: BuildLogRecord[];
+            artifact?: BuildArtifactRecord | null;
+          };
+          if (payload.build) setJob(payload.build);
+          if (payload.logs) setLogs(payload.logs);
+          if (payload.artifact !== undefined) setArtifact(payload.artifact);
+        } catch {
+          // ignore parse errors
+        }
+      });
+      es.addEventListener('done', () => {
+        es?.close();
+      });
+      es.addEventListener('reconnect', () => {
+        es?.close();
+        if (!cancelled) setTimeout(connectSse, 1000);
+      });
+      es.onerror = () => {
+        es?.close();
+        startPollingFallback();
+      };
+    };
+
+    connectSse();
+
     return () => {
-      es.close();
+      cancelled = true;
+      es?.close();
+      if (pollTimer) clearInterval(pollTimer);
     };
   }, [job.id, isActive]);
 

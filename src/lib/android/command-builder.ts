@@ -80,8 +80,9 @@ export function computeBuildCommand(params: {
   }
 
   // Native Android
+  const gradleBin = analysis.hasGradleWrapper === false ? 'gradle' : './gradlew';
   return {
-    command: `./gradlew ${taskPath} --no-daemon`,
+    command: `${gradleBin} ${taskPath} --no-daemon`,
     gradleTask: taskPath,
     normalizedModule: mod,
     normalizedVariant: variant,

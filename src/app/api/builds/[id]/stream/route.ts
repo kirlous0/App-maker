@@ -2,6 +2,7 @@ import { syncBuildJobWithGitHub } from '@/lib/builds/sync-engine';
 import { getSession } from '@/lib/session';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 300;
 
 export async function GET(
   request: Request,
@@ -34,7 +35,7 @@ export async function GET(
       request.signal.addEventListener('abort', abortHandler);
 
       try {
-        for (let tick = 0; tick < 180; tick++) {
+        for (let tick = 0; tick < 60; tick++) {
           if (closed) break;
           const result = await syncBuildJobWithGitHub(session.userId, id);
           sendEvent('update', {
@@ -45,6 +46,11 @@ export async function GET(
 
           if (['succeeded', 'failed', 'cancelled', 'timed_out'].includes(result.job.status)) {
             sendEvent('done', { status: result.job.status });
+            break;
+          }
+
+          if (tick === 59) {
+            sendEvent('reconnect', { reason: 'window_limit' });
             break;
           }
 

@@ -175,11 +175,22 @@ jobs:
               chmod +x android/gradlew
             fi
           else
-            if [[ ! -f "./gradlew" ]]; then
-              echo "gradlew: not found in $PROJ_DIR" >&2
+            if [[ -f "./gradlew" ]]; then
+              chmod +x ./gradlew
+              echo "GRADLE_CMD=./gradlew" >> "$GITHUB_ENV"
+            elif command -v gradle >/dev/null 2>&1; then
+              echo "WARNING: ./gradlew not found in $PROJ_DIR; falling back to system gradle"
+              gradle wrapper --no-daemon || true
+              if [[ -f "./gradlew" ]]; then
+                chmod +x ./gradlew
+                echo "GRADLE_CMD=./gradlew" >> "$GITHUB_ENV"
+              else
+                echo "GRADLE_CMD=gradle" >> "$GITHUB_ENV"
+              fi
+            else
+              echo "Neither ./gradlew nor system gradle found in $PROJ_DIR" >&2
               exit 1
             fi
-            chmod +x ./gradlew
           fi
 
           mkdir -p "$RUNNER_TEMP/repo2apk-signing"
@@ -227,8 +238,9 @@ jobs:
             echo "Executing: ./gradlew $TASK --no-daemon"
             ./gradlew "$TASK" --no-daemon
           else
-            echo "Executing: ./gradlew $TASK --no-daemon"
-            ./gradlew "$TASK" --no-daemon
+            GRADLE_BIN="\${GRADLE_CMD:-./gradlew}"
+            echo "Executing: $GRADLE_BIN $TASK --no-daemon"
+            "$GRADLE_BIN" "$TASK" --no-daemon
           fi
 
       - name: "[Stage 7] APK validation & metadata"
@@ -244,7 +256,10 @@ jobs:
           OUT_DIR="$RUNNER_TEMP/repo2apk-output"
           mkdir -p "$OUT_DIR"
 
-          APK_PATH="$(find . -type f -name '*.apk' ! -name '*androidTest*' ! -name '*-unaligned*' | head -n 1 || true)"
+          APK_PATH="$(find . -type f -path '*/outputs/apk/*' -name '*.apk' ! -name '*androidTest*' ! -name '*-unaligned*' | head -n 1 || true)"
+          if [[ -z "$APK_PATH" ]]; then
+            APK_PATH="$(find . -type f -name '*.apk' ! -path '*/intermediates/*' ! -name '*androidTest*' ! -name '*-unaligned*' | head -n 1 || true)"
+          fi
           if [[ -z "$APK_PATH" || ! -f "$APK_PATH" ]]; then
             echo "No valid APK artifact found after compilation." >&2
             exit 1
