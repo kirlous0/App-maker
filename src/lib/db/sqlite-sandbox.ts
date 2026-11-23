@@ -690,6 +690,21 @@ export const sqliteSandboxStore = {
     return mapBuildJob(updated);
   },
 
+  async claimBuildStatus(
+    buildId: string,
+    expectedStatuses: BuildJobRecord['status'][],
+    patch: Partial<Omit<BuildJobRecord, 'id' | 'user_id' | 'created_at'>>
+  ): Promise<BuildJobRecord | null> {
+    const db = getDb();
+    const existing = db.prepare('SELECT * FROM build_jobs WHERE id = ?').get(buildId) as
+      | Record<string, unknown>
+      | undefined;
+    if (!existing) return null;
+    const current = mapBuildJob(existing);
+    if (!expectedStatuses.includes(current.status)) return null;
+    return await this.updateBuildJob(buildId, patch);
+  },
+
   async listUserBuilds(
     userId: string,
     options?: { limit?: number; status?: string; repo?: string }
@@ -863,6 +878,13 @@ export const sqliteSandboxStore = {
     db.prepare('UPDATE build_artifacts SET download_count = ? WHERE id = ?').run(currentCount + 1, artifactId);
   },
 
+  async softDeleteBuildArtifactsForJob(userId: string, buildJobId: string): Promise<void> {
+    const db = getDb();
+    db.prepare(
+      'UPDATE build_artifacts SET deleted_at = ? WHERE user_id = ? AND build_job_id = ? AND deleted_at IS NULL'
+    ).run(new Date().toISOString(), userId, buildJobId);
+  },
+
   async uploadApkBinary(
     userId: string,
     buildJobId: string,
@@ -885,9 +907,20 @@ export const sqliteSandboxStore = {
   async createChunkedArtifactSignedUrls(
     _manifestPath: string,
     _fileName: string,
-    _expiresInSeconds = 180
-  ): Promise<{ totalBytes: number; chunkUrls: string[] }> {
-    return { totalBytes: 0, chunkUrls: [] };
+    _expiresInSeconds = 300
+  ): Promise<{ totalBytes: number; chunkUrls: string[]; chunkSizes: number[]; chunkPaths: string[] }> {
+    return { totalBytes: 0, chunkUrls: [], chunkSizes: [], chunkPaths: [] };
+  },
+
+  async readStorageByteRange(
+    storagePath: string,
+    startByte: number,
+    endByteInclusive: number
+  ): Promise<Buffer> {
+    const fullPath = path.join(ARTIFACTS_DIR, storagePath);
+    if (!fs.existsSync(fullPath)) throw new Error('Artifact file not found in local sandbox storage.');
+    const buf = fs.readFileSync(fullPath);
+    return buf.subarray(startByte, endByteInclusive + 1);
   },
 
   async streamChunkedApk(storagePath: string): Promise<ReadableStream<Uint8Array>> {

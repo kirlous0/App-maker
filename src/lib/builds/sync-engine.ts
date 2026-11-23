@@ -326,23 +326,40 @@ export async function syncBuildJobWithGitHub(
   }
 
   // 4. GitHub Actions succeeded -> Download artifact, validate real APK, and store in Supabase Private Storage
+  // Atomic claim prevents concurrent SSE/polling/webhook sync calls from racing on the 89 MB upload.
+  const isStaleStoring =
+    job.status === 'storing' && Date.now() - new Date(job.updated_at).getTime() > 90_000;
   const stage7 = stages.find((s) => s.index === 7);
   const stage8 = stages.find((s) => s.index === 8);
   const stage9 = stages.find((s) => s.index === 9);
   if (stage7) {
     stage7.status = 'completed';
-    stage7.completedAt = new Date().toISOString();
+    stage7.completedAt = stage7.completedAt || new Date().toISOString();
   }
   if (stage8) {
     stage8.status = 'running';
-    stage8.startedAt = new Date().toISOString();
+    stage8.startedAt = stage8.startedAt || new Date().toISOString();
   }
 
-  job = await dbStore.updateBuildJob(job.id, {
-    status: 'validating',
-    current_stage: 7,
+  const claimableStatuses: BuildJobRecord['status'][] = isStaleStoring
+    ? ['queued', 'running', 'validating', 'storing']
+    : ['queued', 'running', 'validating'];
+
+  const claimed = await dbStore.claimBuildStatus(job.id, claimableStatuses, {
+    status: 'storing',
+    current_stage: 8,
     stages_state: stages,
   });
+
+  if (!claimed) {
+    // Another worker is currently storing the APK — wait briefly and return latest state without duplicating work.
+    await new Promise((r) => setTimeout(r, 1500));
+    const refreshedJob = (await dbStore.getBuildJob(userId, job.id)) || job;
+    const refreshedArtifact = await dbStore.getBuildArtifactByJob(userId, job.id);
+    const logs = await dbStore.listBuildLogs(userId, job.id);
+    return { job: refreshedJob, logs, artifact: refreshedArtifact };
+  }
+  job = claimed;
 
   try {
     const artifacts = await listWorkflowRunArtifacts(token, owner, repo, run.id);
@@ -447,16 +464,13 @@ export async function syncBuildJobWithGitHub(
         is_unsigned: !concurrentArtifact.is_signed,
         completed_at: doneNow,
         duration_ms: durationMs,
+        error_code: null,
+        error_summary: null,
+        error_details: null,
       });
       const logs = await dbStore.listBuildLogs(userId, job.id);
       return { job, logs, artifact: concurrentArtifact };
     }
-
-    job = await dbStore.updateBuildJob(job.id, {
-      status: 'storing',
-      current_stage: 8,
-      stages_state: stages,
-    });
 
     const uploaded = await dbStore.uploadApkBinary(
       userId,
@@ -515,6 +529,9 @@ export async function syncBuildJobWithGitHub(
       is_unsigned: !validated.isSigned,
       completed_at: doneNow,
       duration_ms: durationMs,
+      error_code: null,
+      error_summary: null,
+      error_details: null,
     });
 
     const logs = await dbStore.listBuildLogs(userId, job.id);
@@ -561,4 +578,26 @@ export async function syncBuildJobWithGitHub(
     const logs = await dbStore.listBuildLogs(userId, job.id);
     return { job, logs, artifact: null };
   }
+}
+
+export async function recoverBuildArtifactFromGitHub(
+  userId: string,
+  buildId: string
+): Promise<BuildArtifactRecord | null> {
+  const job = await dbStore.getBuildJob(userId, buildId);
+  if (!job || !job.github_run_id) return null;
+
+  await dbStore.softDeleteBuildArtifactsForJob(userId, job.id).catch(() => null);
+
+  // Re-open job briefly in validating state and re-run sync cleanly from GitHub Actions artifact
+  await dbStore.updateBuildJob(job.id, {
+    status: 'validating',
+    current_stage: 7,
+    error_code: null,
+    error_summary: null,
+    error_details: null,
+  });
+
+  const synced = await syncBuildJobWithGitHub(userId, job.id);
+  return synced.artifact;
 }

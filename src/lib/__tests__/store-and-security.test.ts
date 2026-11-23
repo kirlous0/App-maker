@@ -161,6 +161,21 @@ describe('Database Store, Artifacts, Signing & Workflow Generation', () => {
     const downloaded = await sqliteSandboxStore.downloadApkBinary(artifact.storage_path);
     expect(downloaded.toString()).toBe('APK_BINARY_CONTENT');
 
+    // Byte-range proxy slice retrieval & atomic claim lock
+    const slice = await sqliteSandboxStore.readStorageByteRange(artifact.storage_path, 4, 9);
+    expect(slice.toString()).toBe('BINARY');
+
+    const firstClaim = await sqliteSandboxStore.claimBuildStatus(job.id, ['running'], {
+      status: 'storing',
+      current_stage: 8,
+    });
+    expect(firstClaim?.status).toBe('storing');
+    const secondClaim = await sqliteSandboxStore.claimBuildStatus(job.id, ['running'], {
+      status: 'storing',
+      current_stage: 8,
+    });
+    expect(secondClaim).toBeNull();
+
     const cleanupRes = await sqliteSandboxStore.cleanupExpiredArtifactsAndStaleBuilds(45);
     expect(cleanupRes.deletedArtifacts).toBe(1);
     expect(await sqliteSandboxStore.getBuildArtifactByJob(user.id, job.id)).toBeNull();

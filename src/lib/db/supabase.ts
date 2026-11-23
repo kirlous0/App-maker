@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type {
   BuildArtifactRecord,
@@ -14,13 +15,60 @@ import type {
 export const APK_BUCKET = 'apk-artifacts';
 export const APK_CHUNKED_BUCKET = 'apk-artifacts-chunked';
 // Supabase Free Tier enforces a 50 MB (52,428,800 byte) per-object upload limit.
-// Any APK larger than 40 MB is transparently split into <= 40 MB private chunks.
-export const SUPABASE_CHUNK_BYTES = 40 * 1024 * 1024;
+// Any APK larger than 15 MB is transparently split into <= 15 MB private chunks
+// for fast, reliable uploads and resilient client/proxy downloads.
+export const SUPABASE_CHUNK_BYTES = 15 * 1024 * 1024;
 
 export interface ChunkedApkManifest {
   fileName: string;
   totalBytes: number;
   chunkPaths: string[];
+  chunkSizes?: number[];
+}
+
+async function uploadStorageObjectWithRetry(
+  db: SupabaseClient,
+  path: string,
+  payload: Buffer,
+  contentType: string,
+  maxAttempts = 3
+): Promise<void> {
+  let lastMsg = 'Unknown upload error';
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const { error } = await db.storage.from(APK_BUCKET).upload(path, payload, {
+        contentType,
+        upsert: true,
+      });
+      if (!error) return;
+      lastMsg = error.message;
+    } catch (err) {
+      lastMsg = err instanceof Error ? err.message : String(err);
+    }
+    if (attempt < maxAttempts) {
+      await new Promise((r) => setTimeout(r, attempt * 800));
+    }
+  }
+  throw new Error(lastMsg);
+}
+
+async function listFolderObjectSizes(
+  db: SupabaseClient,
+  folderPrefix: string
+): Promise<Map<string, number | null>> {
+  const map = new Map<string, number | null>();
+  const { data, error } = await db.storage.from(APK_BUCKET).list(folderPrefix, { limit: 500 });
+  if (error || !data) return map;
+  for (const item of data) {
+    if (item.name) {
+      const sizeVal =
+        typeof (item.metadata as { size?: unknown } | null)?.size === 'number'
+          ? (item.metadata as { size: number }).size
+          : null;
+      map.set(`${folderPrefix}/${item.name}`, sizeVal);
+    }
+  }
+  return map;
 }
 
 let cachedAdminClient: SupabaseClient | null = null;
@@ -387,6 +435,23 @@ export const supabaseStore = {
     return data as BuildJobRecord;
   },
 
+  async claimBuildStatus(
+    buildId: string,
+    expectedStatuses: BuildJobRecord['status'][],
+    patch: Partial<Omit<BuildJobRecord, 'id' | 'user_id' | 'created_at'>>
+  ): Promise<BuildJobRecord | null> {
+    const db = getSupabaseAdmin();
+    const { data, error } = await db
+      .from('build_jobs')
+      .update(patch)
+      .eq('id', buildId)
+      .in('status', expectedStatuses)
+      .select('*')
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    return (data as BuildJobRecord) || null;
+  },
+
   async listUserBuilds(
     userId: string,
     options?: { limit?: number; status?: string; repo?: string }
@@ -605,6 +670,16 @@ export const supabaseStore = {
       .eq('id', artifactId);
   },
 
+  async softDeleteBuildArtifactsForJob(userId: string, buildJobId: string): Promise<void> {
+    const db = getSupabaseAdmin();
+    await db
+      .from('build_artifacts')
+      .update({ deleted_at: new Date().toISOString() })
+      .eq('user_id', userId)
+      .eq('build_job_id', buildJobId)
+      .is('deleted_at', null);
+  },
+
   async uploadApkBinary(
     userId: string,
     buildJobId: string,
@@ -613,33 +688,47 @@ export const supabaseStore = {
   ): Promise<{ storageBucket: string; storagePath: string }> {
     const db = getSupabaseAdmin();
     const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const basePath = `${userId}/${buildJobId}/${safeName}`;
+    // Unique upload folder prevents concurrent sync attempts from overwriting or deleting each other's chunks.
+    const uploadId = crypto.randomUUID().slice(0, 8);
+    const folderPrefix = `${userId}/${buildJobId}/${uploadId}`;
+    const basePath = `${folderPrefix}/${safeName}`;
 
     if (buffer.byteLength <= SUPABASE_CHUNK_BYTES) {
-      const { error } = await db.storage.from(APK_BUCKET).upload(basePath, buffer, {
-        contentType: 'application/vnd.android.package-archive',
-        upsert: true,
-      });
-      if (error) throw new Error(`Supabase Storage upload failed: ${error.message}`);
+      await uploadStorageObjectWithRetry(
+        db,
+        basePath,
+        buffer,
+        'application/vnd.android.package-archive'
+      );
       return { storageBucket: APK_BUCKET, storagePath: basePath };
     }
 
     const chunkPaths: string[] = [];
+    const chunkSizes: number[] = [];
     for (let offset = 0, partIndex = 0; offset < buffer.byteLength; offset += SUPABASE_CHUNK_BYTES, partIndex++) {
       const end = Math.min(offset + SUPABASE_CHUNK_BYTES, buffer.byteLength);
       const slice = buffer.subarray(offset, end);
       const partPath = `${basePath}.part${String(partIndex).padStart(3, '0')}`;
-      const { error: partErr } = await db.storage.from(APK_BUCKET).upload(partPath, slice, {
-        contentType: 'application/octet-stream',
-        upsert: true,
-      });
-      if (partErr) {
+      try {
+        await uploadStorageObjectWithRetry(db, partPath, slice, 'application/octet-stream');
+      } catch (err) {
         if (chunkPaths.length > 0) {
           await db.storage.from(APK_BUCKET).remove(chunkPaths).catch(() => null);
         }
-        throw new Error(`Supabase Storage chunk upload failed (part ${partIndex}): ${partErr.message}`);
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`Supabase Storage chunk upload failed (part ${partIndex}): ${msg}`);
       }
       chunkPaths.push(partPath);
+      chunkSizes.push(slice.byteLength);
+    }
+
+    // Verify all chunks exist in Storage with matching byte lengths before persisting manifest
+    const uploadedMap = await listFolderObjectSizes(db, folderPrefix);
+    for (let i = 0; i < chunkPaths.length; i++) {
+      if (!uploadedMap.has(chunkPaths[i])) {
+        await db.storage.from(APK_BUCKET).remove(chunkPaths).catch(() => null);
+        throw new Error(`ARTIFACT_STORAGE_VERIFICATION_FAILED: chunk ${i} missing after upload`);
+      }
     }
 
     const manifestPath = `${basePath}.manifest`;
@@ -647,16 +736,19 @@ export const supabaseStore = {
       fileName: safeName,
       totalBytes: buffer.byteLength,
       chunkPaths,
+      chunkSizes,
     };
-    const { error: manifestErr } = await db.storage
-      .from(APK_BUCKET)
-      .upload(manifestPath, Buffer.from(JSON.stringify(manifest), 'utf8'), {
-        contentType: 'application/octet-stream',
-        upsert: true,
-      });
-    if (manifestErr) {
+    try {
+      await uploadStorageObjectWithRetry(
+        db,
+        manifestPath,
+        Buffer.from(JSON.stringify(manifest), 'utf8'),
+        'application/octet-stream'
+      );
+    } catch (err) {
       await db.storage.from(APK_BUCKET).remove(chunkPaths).catch(() => null);
-      throw new Error(`Supabase Storage manifest upload failed: ${manifestErr.message}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Supabase Storage manifest upload failed: ${msg}`);
     }
 
     return { storageBucket: APK_CHUNKED_BUCKET, storagePath: manifestPath };
@@ -665,9 +757,14 @@ export const supabaseStore = {
   async createArtifactSignedUrl(
     storagePath: string,
     fileName: string,
-    expiresInSeconds = 120
+    expiresInSeconds = 180
   ): Promise<string> {
     const db = getSupabaseAdmin();
+    const folderPrefix = storagePath.slice(0, storagePath.lastIndexOf('/'));
+    const existing = await listFolderObjectSizes(db, folderPrefix);
+    if (!existing.has(storagePath)) {
+      throw new Error('ARTIFACT_OBJECTS_MISSING: APK object not found in storage.');
+    }
     const { data, error } = await db.storage
       .from(APK_BUCKET)
       .createSignedUrl(storagePath, expiresInSeconds, { download: fileName });
@@ -680,18 +777,33 @@ export const supabaseStore = {
   async createChunkedArtifactSignedUrls(
     manifestPath: string,
     _fileName: string,
-    expiresInSeconds = 180
-  ): Promise<{ totalBytes: number; chunkUrls: string[] }> {
+    expiresInSeconds = 300
+  ): Promise<{ totalBytes: number; chunkUrls: string[]; chunkSizes: number[]; chunkPaths: string[] }> {
     const db = getSupabaseAdmin();
     const { data: manifestBlob, error: manifestErr } = await db.storage
       .from(APK_BUCKET)
       .download(manifestPath);
     if (manifestErr || !manifestBlob) {
-      throw new Error(manifestErr?.message || 'Failed to read chunked APK manifest.');
+      throw new Error(`ARTIFACT_OBJECTS_MISSING: ${manifestErr?.message || 'Manifest missing in storage.'}`);
     }
     const manifest = JSON.parse(await manifestBlob.text()) as ChunkedApkManifest;
+    const folderPrefix = manifestPath.slice(0, manifestPath.lastIndexOf('/'));
+    const existing = await listFolderObjectSizes(db, folderPrefix);
+
     const chunkUrls: string[] = [];
-    for (const partPath of manifest.chunkPaths) {
+    const chunkSizes: number[] = [];
+    for (let i = 0; i < manifest.chunkPaths.length; i++) {
+      const partPath = manifest.chunkPaths[i];
+      if (!existing.has(partPath)) {
+        throw new Error(`ARTIFACT_OBJECTS_MISSING: Missing APK chunk ${i} (${partPath})`);
+      }
+      const recordedSize = existing.get(partPath);
+      const expectedSize = manifest.chunkSizes?.[i] ?? recordedSize ?? 0;
+      if (recordedSize !== null && expectedSize > 0 && recordedSize !== expectedSize) {
+        throw new Error(
+          `ARTIFACT_OBJECTS_MISSING: Corrupted APK chunk ${i} size (${recordedSize} != ${expectedSize})`
+        );
+      }
       const { data, error } = await db.storage
         .from(APK_BUCKET)
         .createSignedUrl(partPath, expiresInSeconds);
@@ -699,8 +811,36 @@ export const supabaseStore = {
         throw new Error(error?.message || `Failed to sign APK chunk ${partPath}`);
       }
       chunkUrls.push(data.signedUrl);
+      chunkSizes.push(expectedSize);
     }
-    return { totalBytes: manifest.totalBytes, chunkUrls };
+    return {
+      totalBytes: manifest.totalBytes,
+      chunkUrls,
+      chunkSizes,
+      chunkPaths: manifest.chunkPaths,
+    };
+  },
+
+  async readStorageByteRange(
+    storagePath: string,
+    startByte: number,
+    endByteInclusive: number
+  ): Promise<Buffer> {
+    const db = getSupabaseAdmin();
+    const { data, error } = await db.storage.from(APK_BUCKET).createSignedUrl(storagePath, 120);
+    if (error || !data?.signedUrl) {
+      throw new Error(error?.message || 'Failed to sign APK chunk range URL');
+    }
+    const res = await fetch(data.signedUrl, {
+      headers: {
+        Range: `bytes=${startByte}-${endByteInclusive}`,
+      },
+      cache: 'no-store',
+    });
+    if (!res.ok && res.status !== 206) {
+      throw new Error(`Chunk range fetch failed (${res.status})`);
+    }
+    return Buffer.from(await res.arrayBuffer());
   },
 
   async streamChunkedApk(manifestPath: string): Promise<ReadableStream<Uint8Array>> {
@@ -709,9 +849,16 @@ export const supabaseStore = {
       .from(APK_BUCKET)
       .download(manifestPath);
     if (manifestErr || !manifestBlob) {
-      throw new Error(manifestErr?.message || 'Failed to read chunked APK manifest.');
+      throw new Error(`ARTIFACT_OBJECTS_MISSING: ${manifestErr?.message || 'Failed to read chunked APK manifest.'}`);
     }
     const manifest = JSON.parse(await manifestBlob.text()) as ChunkedApkManifest;
+    const folderPrefix = manifestPath.slice(0, manifestPath.lastIndexOf('/'));
+    const existing = await listFolderObjectSizes(db, folderPrefix);
+    for (const partPath of manifest.chunkPaths) {
+      if (!existing.has(partPath)) {
+        throw new Error(`ARTIFACT_OBJECTS_MISSING: Missing chunk ${partPath}`);
+      }
+    }
     const chunkPaths = [...manifest.chunkPaths];
 
     return new ReadableStream<Uint8Array>({

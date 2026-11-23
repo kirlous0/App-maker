@@ -506,7 +506,7 @@ describe('APK Validation & Error Classification', () => {
 
   it('attributes Stage 7 upload-artifact logs cleanly and enforces < 50 MB chunk limit', () => {
     expect(mapGitHubStepNameToStageIndex('actions/upload-artifact@v4', 6)).toBe(7);
-    expect(SUPABASE_CHUNK_BYTES).toBe(40 * 1024 * 1024);
+    expect(SUPABASE_CHUNK_BYTES).toBe(15 * 1024 * 1024);
     expect(SUPABASE_CHUNK_BYTES).toBeLessThan(50 * 1024 * 1024);
 
     const sampleLog = [

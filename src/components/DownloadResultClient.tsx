@@ -12,7 +12,7 @@ import {
   ShieldCheck,
   Terminal,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Dictionary } from '@/lib/i18n/dictionary';
 import type { BuildArtifactRecord, BuildJobRecord, SupportedLanguage } from '@/lib/types';
 
@@ -47,6 +47,7 @@ export function DownloadResultClient({
   const [downloading, setDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const autoTriggeredRef = useRef(false);
 
   const handleCopySha = async () => {
     await navigator.clipboard.writeText(artifact.sha256);
@@ -54,7 +55,93 @@ export function DownloadResultClient({
     setTimeout(() => setCopiedSha(false), 1800);
   };
 
-  const handleDownload = async () => {
+  const fetchChunkDirect = async (
+    chunkUrl: string,
+    expectedSize: number,
+    onBytes: (delta: number) => void
+  ): Promise<Uint8Array> => {
+    const chunkRes = await fetch(chunkUrl);
+    if (!chunkRes.ok) {
+      throw new Error(`Direct chunk download failed with status ${chunkRes.status}`);
+    }
+    let result: Uint8Array;
+    if (chunkRes.body) {
+      const reader = chunkRes.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let sum = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          sum += value.byteLength;
+          onBytes(value.byteLength);
+        }
+      }
+      result = new Uint8Array(sum);
+      let pos = 0;
+      for (const c of chunks) {
+        result.set(c, pos);
+        pos += c.byteLength;
+      }
+    } else {
+      const ab = await chunkRes.arrayBuffer();
+      result = new Uint8Array(ab);
+      onBytes(result.byteLength);
+    }
+
+    if (expectedSize > 0 && result.byteLength !== expectedSize) {
+      throw new Error(`Chunk size mismatch (${result.byteLength} != ${expectedSize})`);
+    }
+    return result;
+  };
+
+  const fetchChunkViaProxySlices = async (
+    chunkIndex: number,
+    expectedSize: number,
+    onBytes: (delta: number) => void
+  ): Promise<Uint8Array> => {
+    const sliceLen = 3 * 1024 * 1024; // 3 MB <= Vercel 4.5 MB limit
+    const slices: Uint8Array[] = [];
+    for (let start = 0; start < expectedSize; start += sliceLen) {
+      const end = Math.min(start + sliceLen - 1, expectedSize - 1);
+      let sliceBytes: Uint8Array | null = null;
+      let lastErr: Error | null = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const r = await fetch(
+            `/api/builds/${job.id}/download?chunkIndex=${chunkIndex}&start=${start}&end=${end}`
+          );
+          if (!r.ok) {
+            throw new Error(`Proxy slice HTTP ${r.status}`);
+          }
+          sliceBytes = new Uint8Array(await r.arrayBuffer());
+          const wanted = end - start + 1;
+          if (sliceBytes.byteLength !== wanted) {
+            throw new Error(`Slice truncated (${sliceBytes.byteLength} != ${wanted})`);
+          }
+          break;
+        } catch (err) {
+          lastErr = err instanceof Error ? err : new Error(String(err));
+        }
+      }
+      if (!sliceBytes) {
+        throw lastErr || new Error('Proxy chunk download failed.');
+      }
+      slices.push(sliceBytes);
+      onBytes(sliceBytes.byteLength);
+    }
+
+    const combined = new Uint8Array(slices.reduce((acc, s) => acc + s.byteLength, 0));
+    let pos = 0;
+    for (const s of slices) {
+      combined.set(s, pos);
+      pos += s.byteLength;
+    }
+    return combined;
+  };
+
+  const handleDownload = useCallback(async () => {
     if (downloading) return;
     setDownloading(true);
     setDownloadProgress(null);
@@ -65,6 +152,7 @@ export function DownloadResultClient({
         chunked?: boolean;
         signedUrl?: string;
         chunkUrls?: string[];
+        chunkSizes?: number[];
         fileName?: string;
         sizeBytes?: number;
         error?: string;
@@ -73,7 +161,7 @@ export function DownloadResultClient({
         throw new Error(data.error || 'Failed to prepare APK download.');
       }
 
-      if (!data.chunked || !data.chunkUrls || data.chunkUrls.length <= 1) {
+      if (!data.chunked || !data.chunkUrls || data.chunkUrls.length === 0) {
         window.location.assign(data.signedUrl!);
         return;
       }
@@ -81,45 +169,41 @@ export function DownloadResultClient({
       const parts: BlobPart[] = [];
       let received = 0;
       const total = data.sizeBytes || artifact.size_bytes || 0;
+      const updateProgress = (delta: number) => {
+        received += delta;
+        if (total > 0) {
+          setDownloadProgress(Math.min(99, Math.round((received / total) * 100)));
+        }
+      };
 
-      for (const chunkUrl of data.chunkUrls) {
-        const chunkRes = await fetch(chunkUrl);
-        if (!chunkRes.ok) {
-          throw new Error(`Chunk download failed with status ${chunkRes.status}`);
+      for (let i = 0; i < data.chunkUrls.length; i++) {
+        const chunkUrl = data.chunkUrls[i];
+        const expectedSize = data.chunkSizes?.[i] ?? 0;
+        let partBytes: Uint8Array;
+        const progressSnapshot = received;
+        try {
+          partBytes = await fetchChunkDirect(chunkUrl, expectedSize, updateProgress);
+        } catch (directErr) {
+          // Reset partial progress from failed direct attempt and retry safely via <= 3 MB same-origin proxy slices
+          received = progressSnapshot;
+          if (expectedSize <= 0) throw directErr;
+          partBytes = await fetchChunkViaProxySlices(i, expectedSize, updateProgress);
         }
-        if (chunkRes.body) {
-          const reader = chunkRes.body.getReader();
-          const chunks: Uint8Array[] = [];
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) {
-              chunks.push(value);
-              received += value.byteLength;
-              if (total > 0) {
-                setDownloadProgress(Math.min(99, Math.round((received / total) * 100)));
-              }
-            }
-          }
-          const combined = new Uint8Array(chunks.reduce((acc, c) => acc + c.byteLength, 0));
-          let pos = 0;
-          for (const c of chunks) {
-            combined.set(c, pos);
-            pos += c.byteLength;
-          }
-          parts.push(combined);
-        } else {
-          const ab = await chunkRes.arrayBuffer();
-          received += ab.byteLength;
-          if (total > 0) {
-            setDownloadProgress(Math.min(99, Math.round((received / total) * 100)));
-          }
-          parts.push(ab);
-        }
+        parts.push(partBytes as unknown as BlobPart);
+      }
+
+      const blob = new Blob(parts, { type: 'application/vnd.android.package-archive' });
+      if (total > 0 && blob.size !== total) {
+        throw new Error(`APK size mismatch after assembly (${blob.size} != ${total} bytes).`);
+      }
+
+      // Verify APK ZIP magic header ("PK\x03\x04") before triggering save
+      const header = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+      if (header[0] !== 0x50 || header[1] !== 0x4b) {
+        throw new Error('Downloaded payload did not have a valid APK/ZIP header.');
       }
 
       setDownloadProgress(100);
-      const blob = new Blob(parts, { type: 'application/vnd.android.package-archive' });
       const blobUrl = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = blobUrl;
@@ -127,13 +211,23 @@ export function DownloadResultClient({
       document.body.appendChild(link);
       link.click();
       link.remove();
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 120_000);
     } catch (err) {
       setDownloadError(err instanceof Error ? err.message : 'Download failed');
     } finally {
       setDownloading(false);
     }
-  };
+  }, [artifact.file_name, artifact.size_bytes, downloading, job.id]);
+
+  useEffect(() => {
+    if (autoTriggeredRef.current) return;
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('autodownload') === '1') {
+      autoTriggeredRef.current = true;
+      void handleDownload();
+    }
+  }, [handleDownload]);
 
   const isUnsignedRelease = job.build_type === 'release' && !artifact.is_signed;
 
