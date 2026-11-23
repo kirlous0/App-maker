@@ -6,7 +6,9 @@ import { computeBuildCommand } from '@/lib/android/command-builder';
 import { analyzeAndroidProject, discoverCandidateProjectDirectories } from '@/lib/android/detector';
 import { classifyBuildFailure } from '@/lib/android/error-classifier';
 import { mapGitHubStepNameToStageIndex } from '@/lib/builds/stages';
+import { parseGitHubLogsToEntries } from '@/lib/builds/sync-engine';
 import { getRepo2ApkWorkflowYaml } from '@/lib/builds/workflow-template';
+import { SUPABASE_CHUNK_BYTES } from '@/lib/db/supabase';
 import { buildGitHubAppManifest, formatVercelGitHubAppEnv } from '@/lib/github/manifest';
 import YAML from 'yaml';
 import {
@@ -500,5 +502,25 @@ describe('APK Validation & Error Classification', () => {
       'GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\\nLINE1\\nLINE2\\n-----END RSA PRIVATE KEY-----"\n'
     );
     expect(envText).toContain('GITHUB_WEBHOOK_SECRET=whsec_789\n');
+  });
+
+  it('attributes Stage 7 upload-artifact logs cleanly and enforces < 50 MB chunk limit', () => {
+    expect(mapGitHubStepNameToStageIndex('actions/upload-artifact@v4', 6)).toBe(7);
+    expect(SUPABASE_CHUNK_BYTES).toBe(40 * 1024 * 1024);
+    expect(SUPABASE_CHUNK_BYTES).toBeLessThan(50 * 1024 * 1024);
+
+    const sampleLog = [
+      '2026-11-23T19:26:00Z ##[group]Run [Stage 6] Compile APK',
+      '2026-11-23T19:29:59Z BUILD SUCCESSFUL in 3m 2s',
+      '2026-11-23T19:30:01Z ##[group]Run [Stage 7] Validate APK & Generate Metadata',
+      '2026-11-23T19:30:01Z Validated APK: app-debug.apk (SHA-256: abcdef)',
+      '2026-11-23T19:30:02Z ##[group]Run actions/upload-artifact@v4',
+      '2026-11-23T19:30:08Z Artifact repo2apk-565001efe33c72282629.zip uploaded!',
+    ].join('\n');
+
+    const parsed = parseGitHubLogsToEntries(sampleLog);
+    expect(parsed.some((e) => e.stage_index === 6 && e.content.includes('BUILD SUCCESSFUL'))).toBe(true);
+    expect(parsed.some((e) => e.stage_index === 7 && e.content.includes('Validated APK'))).toBe(true);
+    expect(parsed.some((e) => e.stage_index === 7 && e.content.includes('upload-artifact@v4'))).toBe(true);
   });
 });

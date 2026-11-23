@@ -878,11 +878,31 @@ export const sqliteSandboxStore = {
   },
 
   async createArtifactSignedUrl(_storagePath: string, _fileName: string, _expiresInSeconds = 120): Promise<string> {
-    // In sandbox SQLite fallback, downloads stream directly via authenticated /api/builds/[id]/download?stream=1
+    // In sandbox SQLite fallback, downloads stream directly via authenticated /api/builds/[id]/download?proxy=1
     return '';
   },
 
-  async downloadApkBinary(storagePath: string): Promise<Buffer> {
+  async createChunkedArtifactSignedUrls(
+    _manifestPath: string,
+    _fileName: string,
+    _expiresInSeconds = 180
+  ): Promise<{ totalBytes: number; chunkUrls: string[] }> {
+    return { totalBytes: 0, chunkUrls: [] };
+  },
+
+  async streamChunkedApk(storagePath: string): Promise<ReadableStream<Uint8Array>> {
+    const fullPath = path.join(ARTIFACTS_DIR, storagePath);
+    if (!fs.existsSync(fullPath)) throw new Error('Artifact file not found in local sandbox storage.');
+    const buf = fs.readFileSync(fullPath);
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(buf));
+        controller.close();
+      },
+    });
+  },
+
+  async downloadApkBinary(storagePath: string, _storageBucket?: string): Promise<Buffer> {
     const fullPath = path.join(ARTIFACTS_DIR, storagePath);
     if (!fs.existsSync(fullPath)) throw new Error('Artifact file not found in local sandbox storage.');
     return fs.readFileSync(fullPath);
@@ -907,7 +927,7 @@ export const sqliteSandboxStore = {
       .prepare(
         `UPDATE build_jobs SET status = 'timed_out', error_code = 'BUILD_TIMEOUT',
          error_summary = ?, completed_at = ?, updated_at = ?
-         WHERE status IN ('queued', 'running', 'validating', 'storing') AND started_at < ?`
+         WHERE status IN ('queued', 'running') AND started_at < ?`
       )
       .run(`Build exceeded ${timeoutMinutes}-minute timeout.`, nowIso, nowIso, cutoff);
 

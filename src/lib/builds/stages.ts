@@ -98,6 +98,6 @@ export function mapGitHubStepNameToStageIndex(stepName: string, fallbackStage = 
   if (lower.includes('dependenc') || lower.includes('pub get') || lower.includes('npm') || lower.includes('yarn')) return 4;
   if (lower.includes('configuration') || lower.includes('signing') || lower.includes('gradle wrapper')) return 5;
   if (lower.includes('compil') || lower.includes('build apk') || lower.includes('assemble')) return 6;
-  if (lower.includes('validat') || lower.includes('upload apk artifact')) return 7;
+  if (lower.includes('validat') || lower.includes('upload apk artifact') || lower.includes('upload-artifact')) return 7;
   return fallbackStage;
 }

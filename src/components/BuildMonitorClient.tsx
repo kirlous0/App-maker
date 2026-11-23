@@ -59,6 +59,7 @@ export function BuildMonitorClient({
   const [expandedTerminal, setExpandedTerminal] = useState(false);
   const [copied, setCopied] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState<{ message: string; needsWorkflowUpdate: boolean } | null>(null);
   const [nowTick, setNowTick] = useState(() => Date.now());
@@ -85,17 +86,22 @@ export function BuildMonitorClient({
         if (cancelled) return;
         try {
           const res = await fetch(`/api/builds/${job.id}/sync`, { method: 'POST' });
-          if (!res.ok) return;
           const payload = (await res.json()) as {
             build?: BuildJobRecord;
             logs?: BuildLogRecord[];
             artifact?: BuildArtifactRecord | null;
+            error?: string;
           };
+          if (!res.ok) {
+            if (payload.error) setSyncError(payload.error);
+            return;
+          }
+          setSyncError(null);
           if (payload.build) setJob(payload.build);
           if (payload.logs) setLogs(payload.logs);
           if (payload.artifact !== undefined) setArtifact(payload.artifact);
         } catch {
-          // ignore transient poll errors
+          // ignore transient network errors
         }
       };
       void pollOnce();
@@ -114,11 +120,23 @@ export function BuildMonitorClient({
             logs?: BuildLogRecord[];
             artifact?: BuildArtifactRecord | null;
           };
+          setSyncError(null);
           if (payload.build) setJob(payload.build);
           if (payload.logs) setLogs(payload.logs);
           if (payload.artifact !== undefined) setArtifact(payload.artifact);
         } catch {
           // ignore parse errors
+        }
+      });
+      es.addEventListener('error', (event) => {
+        const msgEvent = event as MessageEvent;
+        if (msgEvent?.data) {
+          try {
+            const payload = JSON.parse(msgEvent.data) as { message?: string };
+            if (payload.message) setSyncError(payload.message);
+          } catch {
+            // ignore non-JSON SSE error
+          }
         }
       });
       es.addEventListener('done', () => {
@@ -166,13 +184,18 @@ export function BuildMonitorClient({
 
   const handleManualSync = async () => {
     setSyncing(true);
+    setSyncError(null);
     try {
       const res = await fetch(`/api/builds/${job.id}/sync`, { method: 'POST' });
       const data = (await res.json()) as {
         build?: BuildJobRecord;
         logs?: BuildLogRecord[];
         artifact?: BuildArtifactRecord | null;
+        error?: string;
       };
+      if (!res.ok) {
+        setSyncError(data.error || 'Sync failed.');
+      }
       if (data.build) setJob(data.build);
       if (data.logs) setLogs(data.logs);
       if (data.artifact !== undefined) setArtifact(data.artifact);
@@ -281,6 +304,13 @@ export function BuildMonitorClient({
       </div>
 
       {/* Telemetry Summary Cards */}
+      {syncError && (
+        <div className="flex items-start gap-2.5 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-200">
+          <AlertTriangle className="h-4 w-4 shrink-0 text-amber-400 mt-0.5" />
+          <span className="font-mono break-all">{syncError}</span>
+        </div>
+      )}
+
       <div className="grid gap-3 sm:grid-cols-3">
         <div className="rounded-lg border border-[#1F2430] bg-[#0E1117] p-4 space-y-1">
           <div className="text-xs text-[#8E98AB]">{dict.monitor.currentStageLabel}</div>

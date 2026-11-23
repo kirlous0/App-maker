@@ -3,6 +3,9 @@ import { verifyGitHubWebhookSignature } from '@/lib/crypto';
 import { dbStore } from '@/lib/db';
 import { syncBuildJobWithGitHub } from '@/lib/builds/sync-engine';
 
+export const dynamic = 'force-dynamic';
+export const maxDuration = 300;
+
 export async function POST(request: Request) {
   const secret = process.env.GITHUB_WEBHOOK_SECRET?.trim();
   if (!secret) {

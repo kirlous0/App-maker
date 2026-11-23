@@ -78,7 +78,7 @@ function computeStagesFromJob(
   };
 }
 
-function parseGitHubLogsToEntries(
+export function parseGitHubLogsToEntries(
   rawLogs: string
 ): Array<{ stage_index: number; step_name: string | null; level: 'info' | 'warn' | 'error' | 'debug'; content: string }> {
   const lines = rawLogs.split('\n');
@@ -113,7 +113,8 @@ function parseGitHubLogsToEntries(
 
   for (const line of lines) {
     const groupMatch = line.match(/##\[group\]Run\s+(.*)|##\[group\](.*)/);
-    const stageMatch = line.match(/\[Stage\s*([1-9])\]\s*(.*)/);
+    const isEchoedCommand = /\b(echo|printf)\s+["']?.*\[Stage\s*[1-9]\]/.test(line);
+    const stageMatch = !isEchoedCommand ? line.match(/\[Stage\s*([1-9])\]\s*(.*)/) : null;
     if (stageMatch?.[1]) {
       flush();
       currentStage = parseInt(stageMatch[1], 10);
@@ -121,11 +122,12 @@ function parseGitHubLogsToEntries(
     } else if (groupMatch && (groupMatch[1] || groupMatch[2])) {
       const label = (groupMatch[1] || groupMatch[2]).trim();
       if (label.length < 120) {
-        currentStep = label;
         const mapped = mapGitHubStepNameToStageIndex(label, currentStage);
-        if (mapped >= 1 && mapped <= 7) {
+        if (mapped >= 1 && mapped <= 7 && mapped !== currentStage) {
+          flush();
           currentStage = mapped;
         }
+        currentStep = label;
       }
     }
     chunk.push(line);
@@ -161,9 +163,31 @@ export async function syncBuildJobWithGitHub(
     return { job, logs, artifact: existingArtifact };
   }
 
-  // Timeout check
+  // If the artifact was already stored in an earlier sync, finalize status cleanly instead of re-uploading
+  if (existingArtifact && ['validating', 'storing'].includes(job.status)) {
+    const nowIso = new Date().toISOString();
+    const finalizedStages = job.stages_state.map((st) =>
+      st.index >= 7 ? { ...st, status: 'completed' as const, completedAt: st.completedAt || nowIso } : st
+    );
+    job = await dbStore.updateBuildJob(job.id, {
+      status: 'succeeded',
+      current_stage: 9,
+      stages_state: finalizedStages,
+      is_unsigned: !existingArtifact.is_signed,
+      completed_at: job.completed_at || nowIso,
+      duration_ms:
+        job.duration_ms || Math.max(1000, Date.now() - new Date(job.started_at).getTime()),
+    });
+    const logs = await dbStore.listBuildLogs(userId, job.id);
+    return { job, logs, artifact: existingArtifact };
+  }
+
+  // Timeout check (only applies while queued/running on GitHub Actions; never abort completed runs in post-build sync)
   const timeoutMinutes = parseInt(process.env.BUILD_TIMEOUT_MINUTES || '45', 10) || 45;
-  if (Date.now() - new Date(job.started_at).getTime() > timeoutMinutes * 60 * 1000) {
+  if (
+    ['queued', 'running'].includes(job.status) &&
+    Date.now() - new Date(job.started_at).getTime() > timeoutMinutes * 60 * 1000
+  ) {
     const nowIso = new Date().toISOString();
     job = await dbStore.updateBuildJob(job.id, {
       status: 'timed_out',
@@ -243,9 +267,11 @@ export async function syncBuildJobWithGitHub(
     return { job, logs, artifact: existingArtifact };
   }
 
-  // 3. Run completed -> fetch full real job logs
+  // 3. Run completed -> fetch full real job logs once (skip re-downloading if already in post-build validating/storing with logs)
   let fullLogText = '';
-  if (primaryJob) {
+  const existingLogs = await dbStore.listBuildLogs(userId, job.id);
+  const alreadyHasFullLogs = ['validating', 'storing'].includes(job.status) && existingLogs.length >= 3;
+  if (primaryJob && !alreadyHasFullLogs) {
     const downloadedLogs = await downloadWorkflowJobLogs(token, owner, repo, primaryJob.id);
     if (downloadedLogs) {
       fullLogText = downloadedLogs;
@@ -254,10 +280,12 @@ export async function syncBuildJobWithGitHub(
         await dbStore.replaceBuildLogs(job.id, userId, entries);
       }
     }
+  } else if (existingLogs.length > 0) {
+    fullLogText = existingLogs.map((l) => l.content).join('\n');
   }
 
-  // Clean up any ephemeral secrets used for signing
-  await cleanupEphemeralSecrets(token, owner, repo);
+  // Clean up any ephemeral secrets used for signing (non-fatal)
+  await cleanupEphemeralSecrets(token, owner, repo).catch(() => null);
 
   const completedAt = run.updated_at || new Date().toISOString();
   const durationMs = Math.max(
@@ -316,137 +344,221 @@ export async function syncBuildJobWithGitHub(
     stages_state: stages,
   });
 
-  const artifacts = await listWorkflowRunArtifacts(token, owner, repo, run.id);
-  const matchingArtifact =
-    artifacts.find((a) => !a.expired && a.name.includes(job.run_nonce)) ||
-    artifacts.find((a) => !a.expired);
+  try {
+    const artifacts = await listWorkflowRunArtifacts(token, owner, repo, run.id);
+    const matchingArtifact =
+      artifacts.find((a) => !a.expired && a.name.includes(job.run_nonce)) ||
+      artifacts.find((a) => !a.expired);
 
-  if (!matchingArtifact) {
-    if (stage7) stage7.status = 'failed';
-    if (stage8) stage8.status = 'failed';
-    const diag = classifyBuildFailure({
-      logText: fullLogText,
-      framework: job.framework,
-      explicitErrorCode: 'MISSING_APK_ARTIFACT',
-    });
+    if (!matchingArtifact) {
+      if (stage7) stage7.status = 'failed';
+      if (stage8) stage8.status = 'failed';
+      const diag = classifyBuildFailure({
+        logText: fullLogText,
+        framework: job.framework,
+        explicitErrorCode: 'MISSING_APK_ARTIFACT',
+      });
+      job = await dbStore.updateBuildJob(job.id, {
+        status: 'failed',
+        current_stage: 7,
+        stages_state: stages,
+        completed_at: new Date().toISOString(),
+        duration_ms: durationMs,
+        error_code: diag.code,
+        error_summary: diag.titleEn,
+        error_details: JSON.stringify(diag),
+      });
+      const logs = await dbStore.listBuildLogs(userId, job.id);
+      return { job, logs, artifact: null };
+    }
+
+    let zipBuffer: Buffer | null = await downloadWorkflowArtifactZip(
+      token,
+      owner,
+      repo,
+      matchingArtifact.id
+    );
+    const extracted = extractApkFromGitHubArtifactZip(zipBuffer);
+    zipBuffer = null;
+
+    if (!extracted) {
+      if (stage8) stage8.status = 'failed';
+      const diag = classifyBuildFailure({
+        logText: fullLogText,
+        framework: job.framework,
+        explicitErrorCode: 'MISSING_APK_ARTIFACT',
+      });
+      job = await dbStore.updateBuildJob(job.id, {
+        status: 'failed',
+        current_stage: 8,
+        stages_state: stages,
+        completed_at: new Date().toISOString(),
+        duration_ms: durationMs,
+        error_code: diag.code,
+        error_summary: 'Artifact archive did not contain a valid .apk binary.',
+        error_details: JSON.stringify(diag),
+      });
+      const logs = await dbStore.listBuildLogs(userId, job.id);
+      return { job, logs, artifact: null };
+    }
+
+    const validated = validateApkBuffer(
+      extracted.apkBuffer,
+      extracted.apkFileName,
+      extracted.metadata,
+      job.build_type === 'debug'
+    );
+
+    if (!validated.isValidApk) {
+      if (stage7) stage7.status = 'failed';
+      if (stage8) stage8.status = 'failed';
+      job = await dbStore.updateBuildJob(job.id, {
+        status: 'failed',
+        current_stage: 7,
+        stages_state: stages,
+        completed_at: new Date().toISOString(),
+        duration_ms: durationMs,
+        error_code: 'INVALID_APK_ARTIFACT',
+        error_summary: validated.validationErrors.join(' '),
+      });
+      const logs = await dbStore.listBuildLogs(userId, job.id);
+      return { job, logs, artifact: null };
+    }
+
+    // Re-check if a concurrent sync request already completed artifact upload
+    const concurrentArtifact = await dbStore.getBuildArtifactByJob(userId, job.id);
+    if (concurrentArtifact) {
+      const doneNow = new Date().toISOString();
+      if (stage8) {
+        stage8.status = 'completed';
+        stage8.completedAt = doneNow;
+      }
+      if (stage9) {
+        stage9.status = 'completed';
+        stage9.startedAt = doneNow;
+        stage9.completedAt = doneNow;
+      }
+      job = await dbStore.updateBuildJob(job.id, {
+        status: 'succeeded',
+        github_job_id: primaryJob?.id ?? job.github_job_id,
+        github_run_url: run.html_url,
+        current_stage: 9,
+        stages_state: stages,
+        is_unsigned: !concurrentArtifact.is_signed,
+        completed_at: doneNow,
+        duration_ms: durationMs,
+      });
+      const logs = await dbStore.listBuildLogs(userId, job.id);
+      return { job, logs, artifact: concurrentArtifact };
+    }
+
     job = await dbStore.updateBuildJob(job.id, {
-      status: 'failed',
-      current_stage: 7,
+      status: 'storing',
+      current_stage: 8,
       stages_state: stages,
-      completed_at: new Date().toISOString(),
-      duration_ms: durationMs,
-      error_code: diag.code,
-      error_summary: diag.titleEn,
-      error_details: JSON.stringify(diag),
     });
-    const logs = await dbStore.listBuildLogs(userId, job.id);
-    return { job, logs, artifact: null };
-  }
 
-  const zipBuffer = await downloadWorkflowArtifactZip(token, owner, repo, matchingArtifact.id);
-  const extracted = extractApkFromGitHubArtifactZip(zipBuffer);
-  if (!extracted) {
-    if (stage8) stage8.status = 'failed';
-    const diag = classifyBuildFailure({
-      logText: fullLogText,
-      framework: job.framework,
-      explicitErrorCode: 'MISSING_APK_ARTIFACT',
+    const uploaded = await dbStore.uploadApkBinary(
+      userId,
+      job.id,
+      validated.fileName,
+      extracted.apkBuffer
+    );
+
+    const user = await dbStore.getUserById(userId);
+    const retentionDays =
+      user?.artifact_retention_days || parseInt(process.env.ARTIFACT_RETENTION_DAYS || '7', 10) || 7;
+    const expiresAt = new Date(Date.now() + retentionDays * 24 * 60 * 60 * 1000).toISOString();
+
+    const savedArtifact = await dbStore.createBuildArtifact({
+      build_job_id: job.id,
+      user_id: userId,
+      app_name: validated.appName || job.repo_full_name.split('/')[1],
+      file_name: validated.fileName,
+      storage_bucket: uploaded.storageBucket,
+      storage_path: uploaded.storagePath,
+      size_bytes: validated.sizeBytes,
+      sha256: validated.sha256,
+      package_id: validated.packageId,
+      version_name: validated.versionName || job.build_name,
+      version_code: validated.versionCode || job.build_number,
+      is_signed: validated.isSigned,
+      signing_status: validated.signingStatus,
+      abi: validated.abi,
+      expires_at: expiresAt,
     });
+
+    const doneNow = new Date().toISOString();
+    if (stage8) {
+      stage8.status = 'completed';
+      stage8.completedAt = doneNow;
+    }
+    if (stage9) {
+      stage9.status = 'completed';
+      stage9.startedAt = doneNow;
+      stage9.completedAt = doneNow;
+    }
+
+    await dbStore.appendBuildLog(job.id, userId, {
+      stage_index: 8,
+      step_name: 'Artifact Storage',
+      level: 'info',
+      content: `Stored verified APK "${validated.fileName}" (${validated.sizeBytes} bytes, SHA-256: ${validated.sha256}) in private storage (${uploaded.storageBucket}).`,
+    });
+
+    job = await dbStore.updateBuildJob(job.id, {
+      status: 'succeeded',
+      github_job_id: primaryJob?.id ?? job.github_job_id,
+      github_run_url: run.html_url,
+      current_stage: 9,
+      stages_state: stages,
+      is_unsigned: !validated.isSigned,
+      completed_at: doneNow,
+      duration_ms: durationMs,
+    });
+
+    const logs = await dbStore.listBuildLogs(userId, job.id);
+    return { job, logs, artifact: savedArtifact };
+  } catch (stageErr) {
+    const errMsg = stageErr instanceof Error ? stageErr.message : String(stageErr);
+    if (stage8) {
+      stage8.status = 'failed';
+      stage8.message = errMsg;
+    }
+    await dbStore
+      .appendBuildLog(job.id, userId, {
+        stage_index: 8,
+        step_name: 'Artifact Validation & Storage',
+        level: 'error',
+        content: `Post-build APK storage failed: ${errMsg}`,
+      })
+      .catch(() => null);
+
+    const diag = {
+      code: 'ARTIFACT_STORAGE_ERROR',
+      titleAr: 'فشل حفظ ملف APK بعد اكتمال البناء',
+      titleEn: 'Failed to store APK artifact after build succeeded',
+      explanationAr: `اكتمل البناء على GitHub Actions بنجاح، لكن تعذر تنزيل أو حفظ ملف APK في التخزين الخاص: ${errMsg}`,
+      explanationEn: `GitHub Actions finished compiling the APK, but downloading or uploading the artifact to private storage failed: ${errMsg}`,
+      suggestedFixAr: 'أعد محاولة مزامنة البناء أو ابدأ بناءً جديداً. إذا استمرت المشكلة فتأكد من إعدادات التخزين وصلاحية التطبيق.',
+      suggestedFixEn: 'Retry syncing this build or trigger a fresh build. If the issue persists, check storage capacity and repository permissions.',
+      matchedExcerpt: errMsg,
+      retryable: true,
+    };
+
     job = await dbStore.updateBuildJob(job.id, {
       status: 'failed',
+      github_job_id: primaryJob?.id ?? job.github_job_id,
+      github_run_url: run.html_url,
       current_stage: 8,
       stages_state: stages,
       completed_at: new Date().toISOString(),
       duration_ms: durationMs,
-      error_code: diag.code,
-      error_summary: 'Artifact archive did not contain a valid .apk binary.',
+      error_code: 'ARTIFACT_STORAGE_ERROR',
+      error_summary: errMsg,
       error_details: JSON.stringify(diag),
     });
     const logs = await dbStore.listBuildLogs(userId, job.id);
     return { job, logs, artifact: null };
   }
-
-  const validated = validateApkBuffer(
-    extracted.apkBuffer,
-    extracted.apkFileName,
-    extracted.metadata,
-    job.build_type === 'debug'
-  );
-
-  if (!validated.isValidApk) {
-    if (stage7) stage7.status = 'failed';
-    if (stage8) stage8.status = 'failed';
-    job = await dbStore.updateBuildJob(job.id, {
-      status: 'failed',
-      current_stage: 7,
-      stages_state: stages,
-      completed_at: new Date().toISOString(),
-      duration_ms: durationMs,
-      error_code: 'INVALID_APK_ARTIFACT',
-      error_summary: validated.validationErrors.join(' '),
-    });
-    const logs = await dbStore.listBuildLogs(userId, job.id);
-    return { job, logs, artifact: null };
-  }
-
-  const uploaded = await dbStore.uploadApkBinary(
-    userId,
-    job.id,
-    validated.fileName,
-    extracted.apkBuffer
-  );
-
-  const user = await dbStore.getUserById(userId);
-  const retentionDays = user?.artifact_retention_days || parseInt(process.env.ARTIFACT_RETENTION_DAYS || '7', 10) || 7;
-  const expiresAt = new Date(Date.now() + retentionDays * 24 * 60 * 60 * 1000).toISOString();
-
-  const savedArtifact = await dbStore.createBuildArtifact({
-    build_job_id: job.id,
-    user_id: userId,
-    app_name: validated.appName || job.repo_full_name.split('/')[1],
-    file_name: validated.fileName,
-    storage_bucket: uploaded.storageBucket,
-    storage_path: uploaded.storagePath,
-    size_bytes: validated.sizeBytes,
-    sha256: validated.sha256,
-    package_id: validated.packageId,
-    version_name: validated.versionName || job.build_name,
-    version_code: validated.versionCode || job.build_number,
-    is_signed: validated.isSigned,
-    signing_status: validated.signingStatus,
-    abi: validated.abi,
-    expires_at: expiresAt,
-  });
-
-  const doneNow = new Date().toISOString();
-  if (stage8) {
-    stage8.status = 'completed';
-    stage8.completedAt = doneNow;
-  }
-  if (stage9) {
-    stage9.status = 'completed';
-    stage9.startedAt = doneNow;
-    stage9.completedAt = doneNow;
-  }
-
-  await dbStore.appendBuildLog(job.id, userId, {
-    stage_index: 8,
-    step_name: 'Artifact Storage',
-    level: 'info',
-    content: `Stored verified APK "${validated.fileName}" (${validated.sizeBytes} bytes, SHA-256: ${validated.sha256}) in private storage.`,
-  });
-
-  job = await dbStore.updateBuildJob(job.id, {
-    status: 'succeeded',
-    github_job_id: primaryJob?.id ?? job.github_job_id,
-    github_run_url: run.html_url,
-    current_stage: 9,
-    stages_state: stages,
-    is_unsigned: !validated.isSigned,
-    completed_at: doneNow,
-    duration_ms: durationMs,
-  });
-
-  const logs = await dbStore.listBuildLogs(userId, job.id);
-  return { job, logs, artifact: savedArtifact };
 }

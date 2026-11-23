@@ -2,6 +2,9 @@ import { NextResponse } from 'next/server';
 import { syncBuildJobWithGitHub } from '@/lib/builds/sync-engine';
 import { getSession } from '@/lib/session';
 
+export const dynamic = 'force-dynamic';
+export const maxDuration = 300;
+
 export async function POST(
   _request: Request,
   context: { params: Promise<{ id: string }> }
