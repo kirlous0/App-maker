@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js / build outputs
+.next/
+out/
+dist/
+build/
+
+# Environment variables (NEVER commit secrets)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+!.env.example
+
+# Sandbox / test artifacts
+.data/
+.vercel/
+coverage/
+playwright-report/
+test-results/
+*.tsbuildinfo
+next-env.d.ts
