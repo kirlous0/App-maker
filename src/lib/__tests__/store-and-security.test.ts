@@ -1,12 +1,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import YAML from 'yaml';
 import { createInitialStagesState } from '@/lib/builds/stages';
 import { getRepo2ApkWorkflowYaml } from '@/lib/builds/workflow-template';
 import { encryptSecret } from '@/lib/crypto';
 import type { dbStore as DbStoreType } from '@/lib/db';
+import { fetchInstallationRepositories, verifyRepoInInstallation } from '@/lib/github/client';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'repo2apk-test-'));
 let sqliteSandboxStore: typeof DbStoreType;
@@ -192,5 +193,123 @@ describe('Database Store, Artifacts, Signing & Workflow Generation', () => {
     expect(stepNames).toContain('[Stage 3] Setup Flutter SDK');
     expect(stepNames).toContain('[Stage 7] APK validation & metadata');
     expect(stepNames).toContain('[Stage 7] Upload APK artifact');
+  });
+});
+
+describe('GitHub Token Routing & Installation Repo Verification', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('uses /installation/repositories for ghs_ installation tokens and /repos/{owner}/{repo} for verification', async () => {
+    const calledUrls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        calledUrls.push(u);
+        if (u.includes('/installation/repositories')) {
+          return new Response(
+            JSON.stringify({
+              total_count: 1,
+              repositories: [
+                {
+                  id: 1,
+                  name: 'my-app',
+                  full_name: 'kirlous0/my-app',
+                  owner: { login: 'kirlous0' },
+                  description: null,
+                  private: false,
+                  language: 'Kotlin',
+                  default_branch: 'main',
+                  html_url: 'https://github.com/kirlous0/my-app',
+                  pushed_at: null,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        if (u.endsWith('/repos/kirlous0/my-app')) {
+          return new Response(
+            JSON.stringify({
+              id: 1,
+              name: 'my-app',
+              full_name: 'kirlous0/my-app',
+              owner: { login: 'kirlous0' },
+              description: null,
+              private: false,
+              language: 'Kotlin',
+              default_branch: 'main',
+              html_url: 'https://github.com/kirlous0/my-app',
+              pushed_at: null,
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ message: 'Resource not accessible by integration' }), {
+          status: 403,
+        });
+      })
+    );
+
+    const list = await fetchInstallationRepositories('ghs_install_token_123', 185106316);
+    expect(list).toHaveLength(1);
+    expect(calledUrls[0]).toContain('/installation/repositories');
+    expect(calledUrls[0]).not.toContain('/user/installations');
+
+    const verified = await verifyRepoInInstallation(
+      'ghs_install_token_123',
+      185106316,
+      'kirlous0/my-app'
+    );
+    expect(verified?.full_name).toBe('kirlous0/my-app');
+    expect(calledUrls[1]).toBe('https://api.github.com/repos/kirlous0/my-app');
+
+    const denied = await verifyRepoInInstallation(
+      'ghs_install_token_123',
+      185106316,
+      'someone/ungranted-repo'
+    );
+    expect(denied).toBeNull();
+  });
+
+  it('uses /user/installations/{id}/repositories for ghu_ user OAuth tokens', async () => {
+    const calledUrls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        calledUrls.push(u);
+        return new Response(
+          JSON.stringify({
+            total_count: 1,
+            repositories: [
+              {
+                id: 2,
+                name: 'App-maker',
+                full_name: 'kirlous0/App-maker',
+                owner: { login: 'kirlous0' },
+                description: null,
+                private: false,
+                language: 'TypeScript',
+                default_branch: 'main',
+                html_url: 'https://github.com/kirlous0/App-maker',
+                pushed_at: null,
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      })
+    );
+
+    const verified = await verifyRepoInInstallation(
+      'ghu_user_token_456',
+      185106316,
+      'kirlous0/App-maker'
+    );
+    expect(verified?.full_name).toBe('kirlous0/App-maker');
+    expect(calledUrls[0]).toContain('/user/installations/185106316/repositories');
   });
 });

@@ -99,14 +99,22 @@ export interface GitHubRepoApi {
   pushed_at: string | null;
 }
 
+export function isInstallationToken(token: string): boolean {
+  return token.startsWith('ghs_');
+}
+
 export async function fetchInstallationRepositories(
   token: string,
   installationId: number
 ): Promise<GitHubRepoApi[]> {
   const repos: GitHubRepoApi[] = [];
-  for (let page = 1; page <= 5; page++) {
+  const isAppToken = isInstallationToken(token);
+  for (let page = 1; page <= 20; page++) {
+    const path = isAppToken
+      ? `/installation/repositories?per_page=100&page=${page}`
+      : `/user/installations/${installationId}/repositories?per_page=100&page=${page}`;
     const data = await ghFetch<{ repositories: GitHubRepoApi[]; total_count: number }>(
-      `/user/installations/${installationId}/repositories?per_page=100&page=${page}`,
+      path,
       token
     );
     const batch = data.repositories || [];
@@ -121,6 +129,25 @@ export async function verifyRepoInInstallation(
   installationId: number,
   fullName: string
 ): Promise<GitHubRepoApi | null> {
+  const parts = fullName.split('/');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    return null;
+  }
+  if (isInstallationToken(token)) {
+    const [owner, repo] = parts;
+    try {
+      const repoMeta = await ghFetch<GitHubRepoApi>(
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+        token
+      );
+      return repoMeta.full_name.toLowerCase() === fullName.toLowerCase() ? repoMeta : null;
+    } catch (err) {
+      if (err instanceof GitHubApiError && (err.status === 403 || err.status === 404)) {
+        return null;
+      }
+      throw err;
+    }
+  }
   const repos = await fetchInstallationRepositories(token, installationId);
   return repos.find((r) => r.full_name.toLowerCase() === fullName.toLowerCase()) || null;
 }
