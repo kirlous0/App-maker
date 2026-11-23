@@ -5,6 +5,7 @@ import { extractApkFromGitHubArtifactZip, validateApkBuffer } from '@/lib/androi
 import { computeBuildCommand } from '@/lib/android/command-builder';
 import { analyzeAndroidProject, discoverCandidateProjectDirectories } from '@/lib/android/detector';
 import { classifyBuildFailure } from '@/lib/android/error-classifier';
+import { mapGitHubStepNameToStageIndex } from '@/lib/builds/stages';
 import { getRepo2ApkWorkflowYaml } from '@/lib/builds/workflow-template';
 import { buildGitHubAppManifest, formatVercelGitHubAppEnv } from '@/lib/github/manifest';
 import YAML from 'yaml';
@@ -368,11 +369,19 @@ describe('Hardened Workflow Template & Failure Classifier', () => {
     const sdkStep = steps.find((s) => s.name === '[Stage 3] Setup Android SDK');
     expect(sdkStep?.run).toContain('sdkmanager');
     expect(sdkStep?.run).toContain('platform-tools');
+    expect(sdkStep?.run).toContain('if [[ ! -x "$SDKMANAGER" ]]');
+    expect(sdkStep?.run).toContain('find -L');
+    expect(sdkStep?.run).toContain('chmod -R u+rwX');
     expect(sdkStep?.run).not.toContain('"tools"');
     const cfgStep = steps.find((s) => s.name === '[Stage 5] Android project configuration');
     expect(cfgStep?.run).toContain('distributionUrl');
     expect(cfgStep?.run).toContain('debug.keystore');
     expect(cfgStep?.run).toContain('KEYSTORE_PATH');
+
+    expect(mapGitHubStepNameToStageIndex('[Stage 3] Setup Android SDK')).toBe(3);
+    expect(mapGitHubStepNameToStageIndex('Cleanup ephemeral signing workspace')).toBe(-1);
+    expect(mapGitHubStepNameToStageIndex('Post actions/checkout@v4')).toBe(-1);
+    expect(mapGitHubStepNameToStageIndex('Run set -euo pipefail', 3)).toBe(3);
   });
 
   it('extracts real sdkmanager failure instead of GitHub Actions metadata headers', () => {
@@ -387,6 +396,13 @@ describe('Hardened Workflow Template & Failure Classifier', () => {
     expect(diag.code).toBe('ANDROID_SDK_CONFIG_ERROR');
     expect(diag.matchedLogExcerpt).toContain('sdkmanager');
     expect(diag.matchedLogExcerpt).not.toContain('accept-android-sdk-licenses: true');
+
+    expect(
+      classifyBuildFailure({
+        logText:
+          "chmod: changing permissions of '/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager': Operation not permitted",
+      }).code
+    ).toBe('ANDROID_SDK_CONFIG_ERROR');
 
     expect(
       classifyBuildFailure({ logText: 'File google-services.json is missing.' }).code

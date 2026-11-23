@@ -75,16 +75,29 @@ export function createInitialStagesState(nowIso = new Date().toISOString()): Bui
   }));
 }
 
-export function mapGitHubStepNameToStageIndex(stepName: string): number {
+export function mapGitHubStepNameToStageIndex(stepName: string, fallbackStage = -1): number {
   const lower = stepName.toLowerCase();
   const explicit = lower.match(/\[stage\s*([1-9])\]/);
   if (explicit?.[1]) return parseInt(explicit[1], 10);
+  if (lower.startsWith('post ') || lower.includes('complete job') || lower.includes('cleanup')) return -1;
   if (lower.includes('set up job') || lower.includes('verification')) return 1;
-  if (lower.includes('checkout')) return 2;
-  if (lower.includes('setup java') || lower.includes('setup android') || lower.includes('setup flutter') || lower.includes('setup node') || lower.includes('environment')) return 3;
+  if (lower.includes('checkout') || lower.includes('verify target commit')) return 2;
+  if (
+    lower.includes('setup java') ||
+    lower.includes('setup-java') ||
+    lower.includes('setup android') ||
+    lower.includes('setup-android') ||
+    lower.includes('setup flutter') ||
+    lower.includes('flutter-action') ||
+    lower.includes('setup node') ||
+    lower.includes('setup-node') ||
+    lower.includes('environment')
+  ) {
+    return 3;
+  }
   if (lower.includes('dependenc') || lower.includes('pub get') || lower.includes('npm') || lower.includes('yarn')) return 4;
   if (lower.includes('configuration') || lower.includes('signing') || lower.includes('gradle wrapper')) return 5;
   if (lower.includes('compil') || lower.includes('build apk') || lower.includes('assemble')) return 6;
   if (lower.includes('validat') || lower.includes('upload apk artifact')) return 7;
-  return 6;
+  return fallbackStage;
 }

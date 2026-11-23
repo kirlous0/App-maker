@@ -124,7 +124,7 @@ export function classifyBuildFailure(params: {
     };
   }
 
-  if (/Failed to install the following Android SDK|compileSdkVersion|build-tools|SDK location not found|licenses? not accepted|NDK .* not found|sdkmanager.*failed/i.test(text)) {
+  if (/Failed to install the following Android SDK|compileSdkVersion|build-tools|SDK location not found|licenses? not accepted|NDK .* not found|sdkmanager.*failed|sdkmanager.*Operation not permitted|android\/sdk.*Permission denied/i.test(text)) {
     return {
       code: 'ANDROID_SDK_CONFIG_ERROR',
       titleAr: 'خطأ في إعدادات Android SDK أو التراخيص',
@@ -135,7 +135,7 @@ export function classifyBuildFailure(params: {
       remediationEn: 'Update the workflow file from Configure and verify compileSdk / buildToolsVersion / ndkVersion.',
       matchedLogExcerpt: extractExcerpt(
         text,
-        /Error:.*sdkmanager|Failed to install.*Android SDK|licenses? not accepted|compileSdk|SDK location|NDK .* not found/i
+        /sdkmanager|Operation not permitted|Permission denied|Failed to install.*Android SDK|licenses? not accepted|compileSdk|SDK location|NDK .* not found/i
       ),
     };
   }

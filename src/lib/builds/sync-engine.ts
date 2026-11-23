@@ -122,7 +122,10 @@ function parseGitHubLogsToEntries(
       const label = (groupMatch[1] || groupMatch[2]).trim();
       if (label.length < 120) {
         currentStep = label;
-        currentStage = mapGitHubStepNameToStageIndex(label);
+        const mapped = mapGitHubStepNameToStageIndex(label, currentStage);
+        if (mapped >= 1 && mapped <= 7) {
+          currentStage = mapped;
+        }
       }
     }
     chunk.push(line);
