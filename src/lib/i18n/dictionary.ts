@@ -395,7 +395,7 @@ const ar: Dictionary = {
       'لتشغيل البناء على GitHub Actions، يحتاج Repo2APK إلى إضافة ملف واحد فقط داخل المستودع دون المساس بأي workflows أخرى.',
     workflowUpdateTitle: 'تحديث مطلوب لملف سير عمل البناء',
     workflowUpdateDesc:
-      'تم تحديث قالب البناء لحل أخطاء إعداد Android SDK و Gradle و debug.keystore. راجع التحديث واعتمد تثبيته على هذا الفرع قبل البناء.',
+      'تم تحديث قالب البناء لدعم توافق Android NDK / CMake (بما فيها -lpthread) وتجهيز NDK/CMake/SDK تلقائياً، وإصلاح Gradle Wrapper وسجلات المراحل. راجع التحديث واعتمد تثبيته على هذا الفرع قبل البناء.',
     workflowPermissionsNote: 'الصلاحيات المستخدمة: Contents (Write) و Workflows (Write) و Actions (Write).',
     workflowApproveCheckbox: 'راجعت محتوى ملف workflow وأوافق صراحة على إضافته/تحديثه في هذا المستودع.',
     workflowInstallButton: 'تثبيت ملف Workflow في المستودع',
@@ -704,7 +704,7 @@ const en: Dictionary = {
       'Repo2APK requires installing one dedicated workflow file on this branch without touching any existing workflows.',
     workflowUpdateTitle: 'Build Workflow Update Available',
     workflowUpdateDesc:
-      'The Repo2APK build workflow template has been updated with Android SDK, Gradle, and debug keystore fixes. Review and approve updating it on this branch before building.',
+      'The Repo2APK build workflow template has been updated with Android NDK/CMake compatibility (including `-lpthread` Bionic adaptation), SDK/NDK/CMake provisioning, Gradle wrapper resilience, and cleaner stage logs. Review and approve updating it on this branch before building.',
     workflowPermissionsNote: 'Permissions used: Contents (Write), Workflows (Write), Actions (Write).',
     workflowApproveCheckbox: 'I have reviewed the workflow YAML below and explicitly approve adding/updating it in this repository.',
     workflowInstallButton: 'Approve & Install Workflow',

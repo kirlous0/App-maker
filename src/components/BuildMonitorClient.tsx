@@ -222,6 +222,7 @@ export function BuildMonitorClient({
       const data = (await res.json()) as { build?: { id: string }; error?: string };
       if (res.ok && data.build) {
         router.push(`/builds/${data.build.id}`);
+        return;
       } else if (data.error === 'WORKFLOW_UPDATE_REQUIRED') {
         setRetryError({
           message: dict.monitor.workflowUpdateRequiredError,
@@ -233,9 +234,13 @@ export function BuildMonitorClient({
           needsWorkflowUpdate: false,
         });
       }
-    } finally {
-      setRetrying(false);
+    } catch {
+      setRetryError({
+        message: 'Network error while retrying build.',
+        needsWorkflowUpdate: false,
+      });
     }
+    setRetrying(false);
   };
 
   const currentStageDef =

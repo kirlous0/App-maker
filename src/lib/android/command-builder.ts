@@ -71,8 +71,9 @@ export function computeBuildCommand(params: {
   const taskPath = mod === 'root' ? gradleTask : `:${mod}:${gradleTask}`;
 
   if (analysis.framework === 'react_native' || analysis.framework === 'expo_bare') {
+    const rnGradleBin = analysis.hasGradleWrapper === false ? 'gradle' : './gradlew';
     return {
-      command: `cd android && ./gradlew ${taskPath} --no-daemon`,
+      command: `cd android && ${rnGradleBin} ${taskPath} --no-daemon`,
       gradleTask: taskPath,
       normalizedModule: mod,
       normalizedVariant: variant,

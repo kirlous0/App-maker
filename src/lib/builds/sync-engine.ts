@@ -81,7 +81,7 @@ function computeStagesFromJob(
 export function parseGitHubLogsToEntries(
   rawLogs: string
 ): Array<{ stage_index: number; step_name: string | null; level: 'info' | 'warn' | 'error' | 'debug'; content: string }> {
-  const lines = rawLogs.split('\n');
+  const lines = rawLogs.split(/\r?\n/);
   const entries: Array<{
     stage_index: number;
     step_name: string | null;
@@ -92,6 +92,9 @@ export function parseGitHubLogsToEntries(
   let currentStage = 1;
   let currentStep: string | null = null;
   let chunk: string[] = [];
+  let inEchoedScript = false;
+
+  const stripAnsi = (s: string) => s.replace(/\u001b\[[0-9;]*[A-Za-z]/g, '');
 
   const flush = () => {
     if (chunk.length === 0) return;
@@ -100,8 +103,8 @@ export function parseGitHubLogsToEntries(
       chunk = [];
       return;
     }
-    const isErr = /\b(ERROR|FAILURE:|Exception|fatal:)/i.test(text);
-    const isWarn = !isErr && /\b(WARN|WARNING)\b/i.test(text);
+    const isErr = /\b(ERROR|FAILURE:|Exception|fatal:)|ld\.lld: error:|clang\+\+: error:|BUILD FAILED/i.test(text);
+    const isWarn = !isErr && /\b(WARN|WARNING|COMPATIBILITY SHIM)\b/i.test(text);
     entries.push({
       stage_index: currentStage,
       step_name: currentStep,
@@ -111,10 +114,53 @@ export function parseGitHubLogsToEntries(
     chunk = [];
   };
 
-  for (const line of lines) {
-    const groupMatch = line.match(/##\[group\]Run\s+(.*)|##\[group\](.*)/);
-    const isEchoedCommand = /\b(echo|printf)\s+["']?.*\[Stage\s*[1-9]\]/.test(line);
-    const stageMatch = !isEchoedCommand ? line.match(/\[Stage\s*([1-9])\]\s*(.*)/) : null;
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const cleanLine = stripAnsi(rawLine);
+    const noTs = cleanLine.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+/, '');
+
+    if (/^##\[group\]Run\s+/i.test(noTs)) {
+      let isScriptEcho = false;
+      for (let j = i + 1; j < Math.min(lines.length, i + 80); j++) {
+        const peek = lines[j];
+        const peekNoTs = stripAnsi(peek).replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+/, '');
+        if (/^##\[endgroup\]/i.test(peekNoTs)) break;
+        if (/\u001b\[36;1m/.test(peek) || /^shell:\s+\/usr\/bin\//i.test(peekNoTs)) {
+          isScriptEcho = true;
+          break;
+        }
+      }
+      if (isScriptEcho) {
+        inEchoedScript = true;
+        continue;
+      }
+    }
+
+    if (inEchoedScript) {
+      if (/^##\[endgroup\]/i.test(noTs)) {
+        inEchoedScript = false;
+      }
+      continue;
+    }
+
+    if (/^Post job cleanup\./i.test(noTs)) {
+      flush();
+      break;
+    }
+
+    const bannerMatch = noTs.match(/^===\s*REPO2APK_STAGE:([1-9])\s*(?::\s*(.+?))?\s*===$/);
+    if (bannerMatch?.[1]) {
+      flush();
+      currentStage = parseInt(bannerMatch[1], 10);
+      if (bannerMatch[2]?.trim()) {
+        currentStep = bannerMatch[2].trim();
+      }
+      continue;
+    }
+
+    const groupMatch = noTs.match(/##\[group\]Run\s+(.*)|##\[group\](.*)/);
+    const isEchoedCommand = /\b(echo|printf)\s+["']?.*\[Stage\s*[1-9]\]/.test(noTs);
+    const stageMatch = !isEchoedCommand ? noTs.match(/\[Stage\s*([1-9])\]\s*(.*)/) : null;
     if (stageMatch?.[1]) {
       flush();
       currentStage = parseInt(stageMatch[1], 10);
@@ -130,7 +176,7 @@ export function parseGitHubLogsToEntries(
         currentStep = label;
       }
     }
-    chunk.push(line);
+    chunk.push(cleanLine);
     if (chunk.length >= 80) flush();
   }
   flush();

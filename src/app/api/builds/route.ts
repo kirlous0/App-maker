@@ -176,6 +176,26 @@ export async function POST(request: Request) {
       buildNumber: body.buildNumber,
     });
 
+    // Idempotency guard: prevent double-clicks / duplicate requests from dispatching parallel identical builds
+    const recentBuilds = await dbStore.listUserBuilds(session.userId, {
+      repo: repoMeta.full_name,
+      limit: 5,
+    });
+    const recentDuplicate = recentBuilds.find(
+      (b) =>
+        ['queued', 'running'].includes(b.status) &&
+        b.branch === body.branch &&
+        b.commit_sha === targetSha &&
+        b.project_dir === analysis.projectDir &&
+        b.build_type === buildType &&
+        (b.build_variant || buildType) === cmdInfo.normalizedVariant &&
+        (b.application_module || 'app') === cmdInfo.normalizedModule &&
+        Date.now() - new Date(b.created_at).getTime() < 20_000
+    );
+    if (recentDuplicate) {
+      return NextResponse.json({ build: recentDuplicate, deduplicated: true }, { status: 200 });
+    }
+
     // Resolve signing credentials if release
     let signingConfigId: string | null = null;
     let useRepo2ApkSecrets = false;
@@ -314,6 +334,9 @@ export async function POST(request: Request) {
         java_version: analysis.recommendedJdk || '17',
         flutter_version: analysis.flutterVersion || 'stable',
         compile_sdk: analysis.androidSdk.compileSdk || '',
+        ndk_version: analysis.androidSdk.ndkVersion || '',
+        cmake_version: analysis.androidSdk.cmakeVersion || '',
+        build_tools_version: analysis.androidSdk.buildToolsVersion || '',
         use_repo2apk_secrets: useRepo2ApkSecrets ? 'true' : 'false',
       });
     } catch (dispatchErr) {

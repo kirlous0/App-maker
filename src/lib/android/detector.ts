@@ -313,6 +313,27 @@ function parseManifestInfo(manifestXml: string | null): { packageId: string | nu
   return { packageId: pkg, appLabel: label };
 }
 
+function parseCmakeVersion(content: string): string | null {
+  const blockMatch = content.match(
+    /externalNativeBuild\s*\{[\s\S]{0,280}?cmake\s*\{[\s\S]{0,200}?version\s*(?:=|\s)\s*["']([0-9]+(?:\.[0-9]+)*)["']/
+  );
+  if (blockMatch?.[1]) return blockMatch[1];
+  const direct = content.match(/\bcmakeVersion\s*(?:=|\s)\s*["']([0-9]+(?:\.[0-9]+)*)["']/);
+  return direct?.[1] || null;
+}
+
+function hasPthreadTargetInCmake(cmakeContent: string): boolean {
+  const withoutComments = cmakeContent.replace(/#.*$/gm, '');
+  const matches = withoutComments.matchAll(/target_link_libraries\s*\(([\s\S]*?)\)/gi);
+  for (const m of matches) {
+    const body = m[1] || '';
+    if (/(?:^|[\s(])(?:-l)?pthread(?=[\s)]|$)/.test(body) && !/\$<[^>]*pthread/.test(body)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function inferAgpVersion(rootGradle: string | null, tomlAgp: string | null): string | null {
   if (tomlAgp) return tomlAgp;
   if (!rootGradle) return null;
@@ -425,6 +446,14 @@ export async function analyzeAndroidProject(params: {
           targetSdk: parseGradleStringProp(combinedGradle, ['targetSdk', 'targetSdkVersion']),
           ndkVersion: parseGradleStringProp(combinedGradle, ['ndkVersion']),
           buildToolsVersion: parseGradleStringProp(combinedGradle, ['buildToolsVersion']),
+          cmakeVersion: parseCmakeVersion(combinedGradle),
+          hasNativeCxx:
+            /externalNativeBuild/.test(combinedGradle) ||
+            params.treePaths.some(
+              (p) =>
+                p.startsWith(projectDir === '.' ? 'android/' : `${projectDir}/android/`) &&
+                (/(^|\/)CMakeLists\.txt$/.test(p) || /\.(cpp|cxx|cc)$/i.test(p))
+            ),
         };
         const existingSigning = detectSigningConfig(gradleTexts);
         if (!existingSigning.hasReleaseSigningConfig) {
@@ -569,11 +598,22 @@ export async function analyzeAndroidProject(params: {
         }
 
         const hasGradleWrapper = hasFile('android/gradlew');
-        if (!hasGradleWrapper) {
-          blockers.push({
+        const hasWrapperProps = hasFile('android/gradle/wrapper/gradle-wrapper.properties');
+        if (!hasGradleWrapper && hasWrapperProps) {
+          warnings.push({
             code: 'MISSING_GRADLE_WRAPPER',
-            messageAr: 'ملف android/gradlew غير موجود في المستودع ولا يمكن تشغيل Gradle بأمان بدونه.',
-            messageEn: 'android/gradlew is missing from the repository.',
+            messageAr:
+              'لم يتم العثور على android/gradlew؛ سيقوم مسار البناء بتحميل إصدار Gradle المحدد في gradle-wrapper.properties تلقائياً.',
+            messageEn:
+              'android/gradlew is missing; the workflow runner will download Gradle from gradle-wrapper.properties automatically.',
+          });
+        } else if (!hasGradleWrapper) {
+          warnings.push({
+            code: 'MISSING_GRADLE_WRAPPER',
+            messageAr:
+              'لم يتم العثور على android/gradlew؛ سيحاول مسار البناء استخدام Gradle المثبّت على الخادم تلقائياً.',
+            messageEn:
+              'android/gradlew is missing from the repository; the runner will fall back to system Gradle.',
           });
         }
 
@@ -605,6 +645,14 @@ export async function analyzeAndroidProject(params: {
           targetSdk: parseGradleStringProp(combinedGradle, ['targetSdk', 'targetSdkVersion']),
           ndkVersion: parseGradleStringProp(combinedGradle, ['ndkVersion']),
           buildToolsVersion: parseGradleStringProp(combinedGradle, ['buildToolsVersion']),
+          cmakeVersion: parseCmakeVersion(combinedGradle),
+          hasNativeCxx:
+            /externalNativeBuild/.test(combinedGradle) ||
+            params.treePaths.some(
+              (p) =>
+                p.startsWith(projectDir === '.' ? 'android/' : `${projectDir}/android/`) &&
+                (/(^|\/)CMakeLists\.txt$/.test(p) || /\.(cpp|cxx|cc)$/i.test(p))
+            ),
         };
         const existingSigning = detectSigningConfig(gradleTexts);
         const isKts = hasFile('android/app/build.gradle.kts') || hasFile('android/build.gradle.kts');
@@ -693,7 +741,16 @@ export async function analyzeAndroidProject(params: {
     const appModules: Array<{ name: string; content: string; manifest: string | null }> = [];
     const allModuleContents: string[] = [];
 
-    for (const modDir of Array.from(discoveredGradleDirs).slice(0, 12)) {
+    const prioritizedModules = Array.from(discoveredGradleDirs).sort((a, b) => {
+      const rank = (d: string) => {
+        if (d === 'app' || d === 'mobile' || d === 'androidApp') return 0;
+        if (!d.includes('/')) return 1;
+        return 2;
+      };
+      return rank(a) - rank(b) || a.localeCompare(b);
+    });
+
+    for (const modDir of prioritizedModules.slice(0, 40)) {
       const modPrefix = modDir === '.' ? '' : `${modDir}/`;
       const modGradle =
         (await params.fetchFile(joinDir(projectDir, `${modPrefix}build.gradle.kts`))) ||
@@ -739,14 +796,18 @@ export async function analyzeAndroidProject(params: {
         content: rootGradle || '',
         manifest: await params.fetchFile(joinDir(projectDir, 'src/main/AndroidManifest.xml')),
       };
-      const hasGradleWrapper = hasFile('gradlew');
+      const hasWrapperJarOrNoProps =
+        hasFile('gradle/wrapper/gradle-wrapper.jar') || !hasFile('gradle/wrapper/gradle-wrapper.properties');
+      const hasGradleWrapper = hasFile('gradlew') && hasWrapperJarOrNoProps;
       if (!hasGradleWrapper) {
         warnings.push({
           code: 'MISSING_GRADLE_WRAPPER',
-          messageAr:
-            'لم يتم العثور على سكربت ./gradlew في جذر المشروع؛ سيحاول مسار GitHub Actions تهيئة Wrapper أو استخدام Gradle المثبّت تلقائياً.',
-          messageEn:
-            'Gradle wrapper script (./gradlew) is missing; GitHub Actions will fall back to generating a wrapper or running system Gradle.',
+          messageAr: hasFile('gradlew')
+            ? 'ملف ./gradlew موجود لكن gradle-wrapper.jar مفقود؛ سيحمّل مسار البناء توزيع Gradle المحدد تلقائياً.'
+            : 'لم يتم العثور على سكربت ./gradlew في جذر المشروع؛ سيحاول مسار GitHub Actions تهيئة Wrapper أو استخدام Gradle المثبّت تلقائياً.',
+          messageEn: hasFile('gradlew')
+            ? './gradlew is present without gradle-wrapper.jar; GitHub Actions will download the Gradle distribution automatically.'
+            : 'Gradle wrapper script (./gradlew) is missing; GitHub Actions will fall back to downloading Gradle or running system Gradle.',
         });
       }
 
@@ -787,6 +848,37 @@ export async function analyzeAndroidProject(params: {
         }
       }
 
+      const combinedAllSdkText = [extraSdkText, ...allModuleContents, rootGradle || ''].join('\n');
+      const cmakeFiles = params.treePaths
+        .filter(
+          (p) =>
+            (!prefixSlash || p.startsWith(prefixSlash)) &&
+            /(^|\/)CMakeLists\.txt$/.test(p) &&
+            !/(^|\/)(\.cxx|build|\.gradle)\//.test(p)
+        )
+        .slice(0, 4);
+      const hasNativeCxx =
+        cmakeFiles.length > 0 ||
+        /externalNativeBuild/.test(combinedAllSdkText) ||
+        params.treePaths.some(
+          (p) =>
+            (!prefixSlash || p.startsWith(prefixSlash)) &&
+            (/(^|\/)Android\.mk$/.test(p) || /\.(cpp|cxx|cc)$/i.test(p))
+        );
+
+      if (cmakeFiles.length > 0) {
+        const cmakeContents = await Promise.all(cmakeFiles.map((f) => params.fetchFile(f)));
+        if (cmakeContents.some((c) => c && hasPthreadTargetInCmake(c))) {
+          warnings.push({
+            code: 'NATIVE_CMAKE_PTHREAD_SHIM',
+            messageAr:
+              'تم رصد مكتبة C++/CMake تربط `-lpthread` مباشرة؛ سيطبّق مسار البناء توافق Android NDK Bionic تلقائياً أثناء الترجمة دون تعديل مستودعك.',
+            messageEn:
+              'Detected C++/CMake linking `pthread`; Repo2APK runner automatically applies an Android NDK Bionic link compatibility shim during build.',
+          });
+        }
+      }
+
       const { javaVersion, recommendedJdk } = detectJavaVersion(gradleTexts, agpVersion);
       const { buildTypes, productFlavors } = parseBuildTypesAndFlavors(primaryGradle);
       const manifestInfo = parseManifestInfo(primary.manifest);
@@ -798,8 +890,10 @@ export async function analyzeAndroidProject(params: {
         compileSdk: parseGradleStringProp(extraSdkText, ['compileSdk', 'compileSdkVersion'], catalog.versions, parsedProps),
         minSdk: parseGradleStringProp(extraSdkText, ['minSdk', 'minSdkVersion'], catalog.versions, parsedProps),
         targetSdk: parseGradleStringProp(extraSdkText, ['targetSdk', 'targetSdkVersion'], catalog.versions, parsedProps),
-        ndkVersion: parseGradleStringProp(extraSdkText, ['ndkVersion'], catalog.versions, parsedProps),
-        buildToolsVersion: parseGradleStringProp(extraSdkText, ['buildToolsVersion'], catalog.versions, parsedProps),
+        ndkVersion: parseGradleStringProp(combinedAllSdkText, ['ndkVersion'], catalog.versions, parsedProps),
+        buildToolsVersion: parseGradleStringProp(combinedAllSdkText, ['buildToolsVersion'], catalog.versions, parsedProps),
+        cmakeVersion: parseCmakeVersion(combinedAllSdkText),
+        hasNativeCxx,
       };
 
       const existingSigning = detectSigningConfig(gradleTexts);

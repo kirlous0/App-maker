@@ -77,8 +77,9 @@ export function createInitialStagesState(nowIso = new Date().toISOString()): Bui
 
 export function mapGitHubStepNameToStageIndex(stepName: string, fallbackStage = -1): number {
   const lower = stepName.toLowerCase();
-  const explicit = lower.match(/\[stage\s*([1-9])\]/);
-  if (explicit?.[1]) return parseInt(explicit[1], 10);
+  const explicit = lower.match(/\[stage\s*([1-9])\]|repo2apk_stage:([1-9])/);
+  const explicitDigit = explicit?.[1] || explicit?.[2];
+  if (explicitDigit) return parseInt(explicitDigit, 10);
   if (lower.startsWith('post ') || lower.includes('complete job') || lower.includes('cleanup')) return -1;
   if (lower.includes('set up job') || lower.includes('verification')) return 1;
   if (lower.includes('checkout') || lower.includes('verify target commit')) return 2;

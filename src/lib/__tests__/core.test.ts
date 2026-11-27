@@ -523,4 +523,168 @@ describe('APK Validation & Error Classification', () => {
     expect(parsed.some((e) => e.stage_index === 7 && e.content.includes('Validated APK'))).toBe(true);
     expect(parsed.some((e) => e.stage_index === 7 && e.content.includes('upload-artifact@v4'))).toBe(true);
   });
+
+  it('detects Native C++/CMake/NDK projects (kirlous0/Chess profile) and emits Bionic pthread shim notice', async () => {
+    const files: Record<string, string> = {
+      'settings.gradle.kts': 'include(":app", ":chess-core", ":chess-engine")',
+      'build.gradle.kts': 'plugins { alias(libs.plugins.android.application) apply false }',
+      'gradle/libs.versions.toml':
+        '[versions]\nagp = "9.1.1"\nkotlin = "2.4.21"\n[plugins]\nandroid-application = { id = "com.android.application", version.ref = "agp" }',
+      'gradle/wrapper/gradle-wrapper.properties':
+        'distributionUrl=https\\://services.gradle.org/distributions/gradle-9.3.1-bin.zip',
+      'app/build.gradle.kts': `
+        plugins { alias(libs.plugins.android.application) }
+        android {
+          namespace = "com.example"
+          compileSdk { version = release(36) { minorApiLevel = 1 } }
+          defaultConfig {
+            applicationId = "com.aistudio.ruknchess.qvztmk"
+            minSdk = 24
+            targetSdk = 36
+          }
+        }
+      `,
+      'chess-core/build.gradle.kts': 'plugins { alias(libs.plugins.android.library) }',
+      'chess-engine/build.gradle.kts': `
+        plugins { alias(libs.plugins.android.library) }
+        android {
+          ndkVersion = "28.2.13676358"
+          externalNativeBuild {
+            cmake {
+              version = "3.22.1"
+              path = file("src/main/cpp/CMakeLists.txt")
+            }
+          }
+        }
+      `,
+      'chess-engine/src/main/cpp/CMakeLists.txt': `
+        cmake_minimum_required(VERSION 3.22.1)
+        find_library(log-lib log)
+        target_link_libraries(rukn_stockfish_jni PRIVATE \${log-lib} pthread)
+      `,
+    };
+    const tree = [
+      ...Object.keys(files),
+      'app/src/main/java/com/example/MainActivity.kt',
+      'chess-engine/src/main/cpp/uci_bridge.cpp',
+    ];
+    const analysis = await analyzeAndroidProject({
+      repoFullName: 'kirlous0/Chess',
+      branch: 'main',
+      commitSha: 'b95556e5ae1f81c53e08b2c506054a7ff227609f',
+      projectDir: '.',
+      treePaths: tree,
+      fetchFile: async (p) => files[p] ?? null,
+    });
+
+    expect(analysis.isBuildable).toBe(true);
+    expect(analysis.applicationModules).toEqual(['app']);
+    expect(analysis.androidSdk.compileSdk).toBe('36');
+    expect(analysis.androidSdk.ndkVersion).toBe('28.2.13676358');
+    expect(analysis.androidSdk.cmakeVersion).toBe('3.22.1');
+    expect(analysis.androidSdk.hasNativeCxx).toBe(true);
+    expect(analysis.warnings.some((w) => w.code === 'NATIVE_CMAKE_PTHREAD_SHIM')).toBe(true);
+  });
+
+  it('never misclassifies NDK -lpthread linker errors as MISSING_GRADLE_WRAPPER and strips Post job cleanup', () => {
+    const rawChessLog = [
+      '2026-11-27T22:34:50.100Z ##[group]Run set -euo pipefail',
+      '2026-11-27T22:34:50.101Z \u001b[36;1mecho "Neither ./gradlew nor system gradle found in $dir" >&2\u001b[0m',
+      '2026-11-27T22:34:50.102Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}',
+      '2026-11-27T22:34:50.103Z env:',
+      '2026-11-27T22:34:50.104Z   GRADLE_CMD: /home/runner/work/_temp/repo2apk-gradle/gradle-9.3.1/bin/gradle',
+      '2026-11-27T22:34:50.105Z ##[endgroup]',
+      '2026-11-27T22:34:53.089Z === REPO2APK_STAGE:6:APK compilation ===',
+      '2026-11-27T22:34:53.090Z Executing: /home/runner/work/_temp/repo2apk-gradle/gradle-9.3.1/bin/gradle :app:assembleDebug --no-daemon',
+      '2026-11-27T22:38:24.013Z * Exception is:',
+      "2026-11-27T22:38:24.013Z org.gradle.api.tasks.TaskExecutionException: Execution failed for task ':chess-engine:buildCMakeDebug[arm64-v8a]'.",
+      '2026-11-27T22:38:24.034Z ld.lld: error: unable to find library -lpthread',
+      '2026-11-27T22:38:24.034Z clang++: error: linker command failed with exit code 1',
+      '2026-11-27T22:38:24.035Z ninja: build stopped: subcommand failed.',
+      '2026-11-27T22:38:24.054Z \tat com.android.build.gradle.internal.process.GradleProcessResult.assertNormalExitValue(GradleProcessResult.java:46)',
+      '2026-11-27T22:38:24.054Z BUILD FAILED in 3m 30s',
+      '2026-11-27T22:38:24.386Z ##[error]Process completed with exit code 1.',
+      '2026-11-27T22:38:24.394Z ##[group]Run rm -rf "$RUNNER_TEMP/repo2apk-signing"',
+      '2026-11-27T22:38:24.394Z \u001b[36;1mrm -rf "$RUNNER_TEMP/repo2apk-signing"\u001b[0m',
+      '2026-11-27T22:38:24.394Z env:',
+      '2026-11-27T22:38:24.394Z   GRADLE_CMD: /home/runner/work/_temp/repo2apk-gradle/gradle-9.3.1/bin/gradle',
+      '2026-11-27T22:38:24.394Z ##[endgroup]',
+      '2026-11-27T22:38:24.412Z Post job cleanup.',
+      '2026-11-27T22:38:24.553Z (node:3072) [DEP0040] DeprecationWarning: The `punycode` module is deprecated.',
+    ].join('\n');
+
+    const diag = classifyBuildFailure({ logText: rawChessLog, framework: 'native_android' });
+    expect(diag.code).toBe('NATIVE_NDK_CMAKE_ERROR');
+    expect(diag.matchedLogExcerpt).toContain('unable to find library -lpthread');
+    expect(diag.matchedLogExcerpt).not.toContain('Post job cleanup');
+    expect(diag.matchedLogExcerpt).not.toContain('punycode');
+    expect(diag.matchedLogExcerpt).not.toContain('GRADLE_CMD:');
+
+    const entries = parseGitHubLogsToEntries(rawChessLog);
+    const stage6Entry = entries.find((e) => e.content.includes('ld.lld: error'));
+    expect(stage6Entry?.stage_index).toBe(6);
+    expect(entries.some((e) => e.content.includes('punycode'))).toBe(false);
+  });
+
+  it('includes NDK/CMake provisioning, CRLF gradlew handling, and CMake pthread shim in workflow YAML', () => {
+    const yml = getRepo2ApkWorkflowYaml();
+    const parsed = YAML.parse(yml) as {
+      on?: { workflow_dispatch?: { inputs?: Record<string, unknown> } };
+      jobs?: { build_apk?: { steps?: Array<{ name?: string; run?: string }> } };
+    };
+    expect(parsed.on?.workflow_dispatch?.inputs?.ndk_version).toBeDefined();
+    expect(parsed.on?.workflow_dispatch?.inputs?.cmake_version).toBeDefined();
+    expect(parsed.on?.workflow_dispatch?.inputs?.build_tools_version).toBeDefined();
+    const sdkStep = parsed.jobs?.build_apk?.steps?.find((s) => s.name === '[Stage 3] Setup Android SDK');
+    expect(sdkStep?.run).toContain('ndk;$NDK_VER');
+    expect(sdkStep?.run).toContain('cmake;$CMAKE_VER');
+    const cfgStep = parsed.jobs?.build_apk?.steps?.find((s) => s.name === '[Stage 5] Android project configuration');
+    expect(cfgStep?.run).toContain('gradle-wrapper.jar');
+    expect(cfgStep?.run).toContain('COMPATIBILITY SHIM');
+    expect(cfgStep?.run).toContain('target_link_libraries');
+  });
+
+  it('finds app module in >15-module repos and treats missing RN gradlew with wrapper props as warning', async () => {
+    const files: Record<string, string> = {};
+    const tree: string[] = [];
+    for (let i = 1; i <= 16; i++) {
+      const mod = `aaa-lib-${String(i).padStart(2, '0')}`;
+      files[`${mod}/build.gradle.kts`] = 'plugins { id("com.android.library") }';
+      tree.push(`${mod}/build.gradle.kts`);
+    }
+    files['settings.gradle.kts'] = 'include(":app")';
+    files['app/build.gradle.kts'] = 'plugins { id("com.android.application") }\nandroid { compileSdk = 35 }';
+    tree.push('settings.gradle.kts', 'app/build.gradle.kts', 'gradlew', 'app/src/main/MainActivity.kt');
+
+    const nativeMulti = await analyzeAndroidProject({
+      repoFullName: 'acme/big-mono',
+      branch: 'main',
+      commitSha: '1234abcd',
+      projectDir: '.',
+      treePaths: tree,
+      fetchFile: async (p) => files[p] ?? null,
+    });
+    expect(nativeMulti.isBuildable).toBe(true);
+    expect(nativeMulti.applicationModules).toEqual(['app']);
+
+    const rnFiles: Record<string, string> = {
+      'package.json': JSON.stringify({ name: 'rn-app', dependencies: { 'react-native': '0.76.0' } }),
+      'android/app/build.gradle': 'android { compileSdkVersion 35 }',
+      'android/gradle/wrapper/gradle-wrapper.properties':
+        'distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10.2-all.zip',
+    };
+    const rnAnalysis = await analyzeAndroidProject({
+      repoFullName: 'acme/rn-nowrapper',
+      branch: 'main',
+      commitSha: '5678efab',
+      projectDir: '.',
+      treePaths: Object.keys(rnFiles),
+      fetchFile: async (p) => rnFiles[p] ?? null,
+    });
+    expect(rnAnalysis.isBuildable).toBe(true);
+    expect(rnAnalysis.hasGradleWrapper).toBe(false);
+    expect(computeBuildCommand({ analysis: rnAnalysis, buildType: 'debug' }).command).toBe(
+      'cd android && gradle :app:assembleDebug --no-daemon'
+    );
+  });
 });

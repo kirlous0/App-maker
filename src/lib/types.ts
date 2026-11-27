@@ -112,6 +112,8 @@ export interface AndroidSdkRequirements {
   targetSdk: string | null;
   ndkVersion: string | null;
   buildToolsVersion: string | null;
+  cmakeVersion?: string | null;
+  hasNativeCxx?: boolean;
 }
 
 export interface AndroidProjectAnalysis {

@@ -76,6 +76,25 @@ export async function POST(
       commitSha = latest.sha;
     }
 
+    const recentBuilds = await dbStore.listUserBuilds(session.userId, {
+      repo: previous.repo_full_name,
+      limit: 5,
+    });
+    const recentDuplicate = recentBuilds.find(
+      (b) =>
+        ['queued', 'running'].includes(b.status) &&
+        b.branch === previous.branch &&
+        b.commit_sha === commitSha &&
+        b.project_dir === previous.project_dir &&
+        b.build_type === previous.build_type &&
+        (b.build_variant || previous.build_type) === (previous.build_variant || previous.build_type) &&
+        (b.application_module || 'app') === (previous.application_module || 'app') &&
+        Date.now() - new Date(b.created_at).getTime() < 20_000
+    );
+    if (recentDuplicate) {
+      return NextResponse.json({ build: recentDuplicate, deduplicated: true }, { status: 200 });
+    }
+
     const projectRow = previous.project_id
       ? await dbStore.getProjectById(session.userId, previous.project_id).catch(() => null)
       : null;
@@ -161,6 +180,9 @@ export async function POST(
       java_version: analysis?.recommendedJdk || '17',
       flutter_version: analysis?.flutterVersion || 'stable',
       compile_sdk: analysis?.androidSdk?.compileSdk || '',
+      ndk_version: analysis?.androidSdk?.ndkVersion || '',
+      cmake_version: analysis?.androidSdk?.cmakeVersion || '',
+      build_tools_version: analysis?.androidSdk?.buildToolsVersion || '',
       use_repo2apk_secrets: useRepo2ApkSecrets ? 'true' : 'false',
     });
 

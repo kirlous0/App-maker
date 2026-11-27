@@ -330,12 +330,12 @@ export function ConfigureClient({
       const data = (await res.json()) as { build?: { id: string }; error?: string; message?: string };
       if (!res.ok || !data.build) {
         setErrorMsg(data.message || data.error || 'Failed to start APK build.');
+        setStartingBuild(false);
         return;
       }
       router.push(`/builds/${data.build.id}`);
     } catch {
       setErrorMsg('Network error starting build.');
-    } finally {
       setStartingBuild(false);
     }
   };
@@ -507,7 +507,7 @@ export function ConfigureClient({
               />
               <MetricBox
                 label={dict.configure.sdkLabel}
-                value={`compile:${analysis.androidSdk.compileSdk || '?'} · min:${analysis.androidSdk.minSdk || '?'} · target:${analysis.androidSdk.targetSdk || '?'}`}
+                value={`compile:${analysis.androidSdk.compileSdk || '?'} · min:${analysis.androidSdk.minSdk || '?'} · target:${analysis.androidSdk.targetSdk || '?'}${analysis.androidSdk.ndkVersion ? ` · NDK:${analysis.androidSdk.ndkVersion}` : ''}${analysis.androidSdk.cmakeVersion ? ` · CMake:${analysis.androidSdk.cmakeVersion}` : ''}${analysis.androidSdk.hasNativeCxx ? ' · C++/JNI' : ''}`}
                 mono
               />
               <MetricBox

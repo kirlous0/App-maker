@@ -67,6 +67,21 @@ on:
         required: false
         default: ""
         type: string
+      ndk_version:
+        description: "Detected Android NDK version (optional)"
+        required: false
+        default: ""
+        type: string
+      cmake_version:
+        description: "Detected CMake version (optional)"
+        required: false
+        default: ""
+        type: string
+      build_tools_version:
+        description: "Detected Android build-tools version (optional)"
+        required: false
+        default: ""
+        type: string
       use_repo2apk_secrets:
         description: "Whether encrypted Repo2APK keystore secrets are attached"
         required: false
@@ -87,6 +102,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          printf '=== REPO2APK_STAGE:%s:%s ===\n' '1' 'Repository verification'
           echo "REPO2APK_BUILD_ID=${{ inputs.build_id }}"
           echo "Framework: ${{ inputs.framework }} | Mode: ${{ inputs.build_mode }}"
           if [[ ! "${{ inputs.application_module }}" =~ ^[A-Za-z0-9._:-]+$ ]]; then
@@ -107,6 +123,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          printf '=== REPO2APK_STAGE:%s:%s ===\n' '2' 'Verify target commit'
           CURRENT_SHA="$(git rev-parse HEAD)"
           echo "Checked out commit: $CURRENT_SHA"
           if [[ -n "${{ inputs.commit_sha }}" && "$CURRENT_SHA" != "${{ inputs.commit_sha }}" ]]; then
@@ -124,6 +141,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          printf '=== REPO2APK_STAGE:%s:%s ===\n' '3' 'Setup Android SDK'
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           if [[ ! -d "$SDK_ROOT" ]]; then
             SDK_ROOT="$HOME/Android/Sdk"
@@ -187,6 +205,24 @@ jobs:
             (set +o pipefail; yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platforms;android-$COMPILE_SDK" || true)
           fi
 
+          BUILD_TOOLS_VER="${{ inputs.build_tools_version }}"
+          if [[ "$BUILD_TOOLS_VER" =~ ^[0-9]+(\.[0-9]+)*$ && ! -d "$SDK_ROOT/build-tools/$BUILD_TOOLS_VER" ]]; then
+            echo "Installing Android SDK build-tools;$BUILD_TOOLS_VER..."
+            (set +o pipefail; yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" "build-tools;$BUILD_TOOLS_VER" || true)
+          fi
+
+          NDK_VER="${{ inputs.ndk_version }}"
+          if [[ "$NDK_VER" =~ ^[0-9]+(\.[0-9]+)*$ && ! -d "$SDK_ROOT/ndk/$NDK_VER" ]]; then
+            echo "Installing Android NDK $NDK_VER..."
+            (set +o pipefail; yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" "ndk;$NDK_VER" || true)
+          fi
+
+          CMAKE_VER="${{ inputs.cmake_version }}"
+          if [[ "$CMAKE_VER" =~ ^[0-9]+(\.[0-9]+)*$ && ! -d "$SDK_ROOT/cmake/$CMAKE_VER" ]]; then
+            echo "Installing Android CMake $CMAKE_VER..."
+            (set +o pipefail; yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" "cmake;$CMAKE_VER" || true)
+          fi
+
           echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
           echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
           echo "Android SDK ready at $SDK_ROOT"
@@ -209,6 +245,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          printf '=== REPO2APK_STAGE:%s:%s ===\n' '4' 'Dependency installation'
           PROJ_DIR="${{ inputs.project_dir }}"
           cd "$PROJ_DIR"
           if [[ "${{ inputs.framework }}" == "flutter" ]]; then
@@ -236,6 +273,7 @@ jobs:
           REPO2APK_KEY_PASSWORD: ${{ secrets.REPO2APK_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          printf '=== REPO2APK_STAGE:%s:%s ===\n' '5' 'Android project configuration'
           PROJ_DIR="${{ inputs.project_dir }}"
           cd "$PROJ_DIR"
 
@@ -249,7 +287,14 @@ jobs:
               echo "Configured sdk.dir in $dir/local.properties"
             fi
 
-            if [[ -f "./gradlew" ]]; then
+            if [[ ! -f "gradle.properties" ]] || ! grep -qE '^org\.gradle\.jvmargs=' gradle.properties 2>/dev/null; then
+              if [[ -z "${GRADLE_OPTS:-}" ]]; then
+                echo "GRADLE_OPTS=-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8" >> "$GITHUB_ENV"
+              fi
+            fi
+
+            if [[ -f "./gradlew" && ( -f "gradle/wrapper/gradle-wrapper.jar" || ! -f "gradle/wrapper/gradle-wrapper.properties" ) ]]; then
+              sed -i 's/\r$//' ./gradlew
               chmod +x ./gradlew
               echo "$env_var=./gradlew" >> "$GITHUB_ENV"
             elif [[ -f "gradle/wrapper/gradle-wrapper.properties" ]]; then
@@ -325,6 +370,107 @@ jobs:
             cp ".env.example" ".env"
           fi
 
+          # Ephemeral Android NDK Bionic compatibility: CMakeLists linking bare pthread fails on NDK ld.lld
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PY'
+          import os, re
+
+          skip_dirs = {'.git', '.gradle', '.cxx', 'build', 'node_modules', '.dart_tool', 'dist'}
+          call_pat = re.compile(r'\btarget_link_libraries\s*\(', re.IGNORECASE)
+          pthread_pat = re.compile(r'(?:^|(?<=[\s(]))(?:-l)?pthread(?=[\s)]|$)')
+
+          for root, dirs, files in os.walk('.'):
+              dirs[:] = [d for d in dirs if d not in skip_dirs]
+              for fn in files:
+                  if fn != 'CMakeLists.txt':
+                      continue
+                  path = os.path.join(root, fn)
+                  try:
+                      with open(path, 'r', encoding='utf-8') as f:
+                          content = f.read()
+                  except Exception:
+                      continue
+                  out = []
+                  i = 0
+                  n = len(content)
+                  changed = False
+                  while i < n:
+                      m = call_pat.search(content, i)
+                      if not m:
+                          out.append(content[i:])
+                          break
+                      out.append(content[i:m.end()])
+                      j = m.end()
+                      depth = 1
+                      in_quote = None
+                      in_comment = False
+                      block_chars = []
+                      while j < n and depth > 0:
+                          ch = content[j]
+                          if in_comment:
+                              block_chars.append(ch)
+                              if ch == '\n':
+                                  in_comment = False
+                          elif in_quote:
+                              block_chars.append(ch)
+                              if ch == '\\' and j + 1 < n:
+                                  j += 1
+                                  block_chars.append(content[j])
+                              elif ch == in_quote:
+                                  in_quote = None
+                          else:
+                              if ch == '#':
+                                  in_comment = True
+                                  block_chars.append(ch)
+                              elif ch in ('"', "'"):
+                                  in_quote = ch
+                                  block_chars.append(ch)
+                              elif ch == '(':
+                                  depth += 1
+                                  block_chars.append(ch)
+                              elif ch == ')':
+                                  depth -= 1
+                                  if depth > 0:
+                                      block_chars.append(ch)
+                                  else:
+                                      break
+                              else:
+                                  block_chars.append(ch)
+                          j += 1
+                      block = ''.join(block_chars)
+                      new_lines = []
+                      for line in block.splitlines(keepends=True):
+                          code_part, comment_part = line, ''
+                          q, esc = None, False
+                          for idx_c, c in enumerate(line):
+                              if esc:
+                                  esc = False
+                                  continue
+                              if c == '\\' and q:
+                                  esc = True
+                                  continue
+                              if c in ('"', "'"):
+                                  q = None if q == c else (c if q is None else q)
+                              elif c == '#' and q is None:
+                                  code_part, comment_part = line[:idx_c], line[idx_c:]
+                                  break
+                          new_code = pthread_pat.sub(r'$<$<NOT:$<BOOL:${ANDROID}>>:pthread>', code_part)
+                          if new_code != code_part:
+                              changed = True
+                          new_lines.append(new_code + comment_part)
+                      out.append(''.join(new_lines))
+                      if j < n and content[j] == ')':
+                          out.append(')')
+                          i = j + 1
+                      else:
+                          i = j
+                  if changed:
+                      with open(path, 'w', encoding='utf-8') as f:
+                          f.write(''.join(out))
+                      print(f"COMPATIBILITY SHIM: Adapted bare pthread link target for Android NDK Bionic in {path}")
+          PY
+          fi
+
           if [[ "${{ inputs.framework }}" == "react_native" || "${{ inputs.framework }}" == "expo_bare" || "${{ inputs.framework }}" == "flutter" ]]; then
             if [[ -d "android" ]]; then
               resolve_gradle_dir "android" "ANDROID_GRADLE_CMD"
@@ -353,6 +499,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          printf '=== REPO2APK_STAGE:%s:%s ===\n' '6' 'APK compilation'
           PROJ_DIR="${{ inputs.project_dir }}"
           cd "$PROJ_DIR"
 
@@ -368,6 +515,13 @@ jobs:
 
           if [[ "${{ inputs.framework }}" == "flutter" ]]; then
             CMD=(flutter build apk "--${{ inputs.build_mode }}")
+            VARIANT_LOWER="$(tr '[:upper:]' '[:lower:]' <<< "$VARIANT")"
+            if [[ "$VARIANT_LOWER" != "debug" && "$VARIANT_LOWER" != "release" && "$VARIANT_LOWER" != "profile" ]]; then
+              FLAVOR="$(printf '%s' "$VARIANT" | sed -E 's/(Debug|Release|Profile)$//I')"
+              if [[ -n "$FLAVOR" ]]; then
+                CMD+=(--flavor "$FLAVOR")
+              fi
+            fi
             if [[ "${{ inputs.abi_mode }}" == "split" ]]; then
               CMD+=(--split-per-abi)
             fi
@@ -398,12 +552,31 @@ jobs:
           REPO2APK_KEY_PASSWORD: ${{ secrets.REPO2APK_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          printf '=== REPO2APK_STAGE:%s:%s ===\n' '7' 'APK validation & metadata'
           PROJ_DIR="${{ inputs.project_dir }}"
           cd "$PROJ_DIR"
           OUT_DIR="$RUNNER_TEMP/repo2apk-output"
           mkdir -p "$OUT_DIR"
 
-          APK_PATH="$(find . -type f -path '*/outputs/apk/*' -name '*.apk' ! -name '*androidTest*' ! -name '*-unaligned*' | grep -E 'universal|arm64-v8a' | head -n 1 || true)"
+          MOD="${{ inputs.application_module }}"
+          MOD_CLEAN="${MOD#:}"
+          MOD_PATH="${MOD_CLEAN//://}"
+          SEARCH_ROOT="."
+          if [[ "$MOD_CLEAN" != "root" && -n "$MOD_PATH" ]]; then
+            if [[ -d "$MOD_PATH/build/outputs/apk" ]]; then
+              SEARCH_ROOT="$MOD_PATH/build/outputs/apk"
+            elif [[ -d "android/$MOD_PATH/build/outputs/apk" ]]; then
+              SEARCH_ROOT="android/$MOD_PATH/build/outputs/apk"
+            fi
+          fi
+
+          APK_PATH="$(find "$SEARCH_ROOT" -type f -name '*.apk' ! -path '*/intermediates/*' ! -name '*androidTest*' ! -name '*-unaligned*' | grep -E 'universal|arm64-v8a' | head -n 1 || true)"
+          if [[ -z "$APK_PATH" ]]; then
+            APK_PATH="$(find "$SEARCH_ROOT" -type f -name '*.apk' ! -path '*/intermediates/*' ! -name '*androidTest*' ! -name '*-unaligned*' | head -n 1 || true)"
+          fi
+          if [[ -z "$APK_PATH" ]]; then
+            APK_PATH="$(find . -type f -path '*/outputs/apk/*' -name '*.apk' ! -name '*androidTest*' ! -name '*-unaligned*' | grep -E 'universal|arm64-v8a' | head -n 1 || true)"
+          fi
           if [[ -z "$APK_PATH" ]]; then
             APK_PATH="$(find . -type f -path '*/outputs/apk/*' -name '*.apk' ! -name '*androidTest*' ! -name '*-unaligned*' | head -n 1 || true)"
           fi
@@ -454,7 +627,7 @@ jobs:
             PKG_ID="$(printf '%s\n' "$BADGING" | sed -n "s/.*package: name='\([^']*\)'.*/\1/p" | head -n 1)"
             V_CODE="$(printf '%s\n' "$BADGING" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" | head -n 1)"
             V_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n 1)"
-            APP_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/.*application-label:'\([^']*\)'.*/\1/p" | head -n 1)"
+            APP_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/.*application-label[^:]*:'\([^']*\)'.*/\1/p" | head -n 1)"
           fi
 
           jq -n \
